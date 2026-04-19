@@ -67,6 +67,20 @@ def get_rotation_matrix(yaw, pitch, roll):
     return rroll @ rpitch @ ryaw
 
 
+def quaternion_to_euler_deg(q):
+    """Unit quaternion [w,x,y,z] → (yaw, pitch, roll) degrees. ZYX convention."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll  = np.degrees(np.arctan2(sinr, cosr))
+    sinp  = 2.0 * (w * y - z * x)
+    pitch = np.degrees(np.arcsin(np.clip(sinp, -1.0, 1.0)))
+    siny  = 2.0 * (w * z + x * y)
+    cosy  = 1.0 - 2.0 * (y * y + z * z)
+    yaw   = np.degrees(np.arctan2(siny, cosy))
+    return float(yaw), float(pitch), float(roll)
+
+
 def render_star_camera(star_catalog, yaw, pitch, roll, img_width, img_height, fov_x_degrees, psf_sigma=1.5):
     """
     Project 3D unit-sphere stars into 2D image pixels with physical realism.
@@ -197,68 +211,67 @@ def render_view(manifest, star_catalog, output_path=None, psf_sigma=1.5):
 
 
 class StarTrackerTinyCNN(nn.Module):
-    """CNN for attitude estimation — must match the architecture in train.py."""
+    """Dual-head CNN — must exactly mirror the architecture in train.py."""
     NUM_CLASSES = 6
-    CONV1_OUT_CH = 16
-    CONV2_OUT_CH = 32
-    CONV3_OUT_CH = 64
-    CONV1_K = 5
-    KERNEL = 3
-    STRIDE = 2
-    CONV1_PAD = 2
-    PAD = 1
-    POOL_H = 3
-    POOL_W = 5
-    FC1_OUT = 128
+    CONV1_OUT_CH = 16;  CONV2_OUT_CH = 32;  CONV3_OUT_CH = 64
+    CONV1_K = 5;        KERNEL = 3;         STRIDE = 2
+    CONV1_PAD = 2;      PAD = 1
+    POOL_H = 3;         POOL_W = 5;         FC1_OUT = 128
 
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, self.CONV1_OUT_CH, kernel_size=self.CONV1_K, stride=self.STRIDE, padding=self.CONV1_PAD)
+        self.conv1 = nn.Conv2d(1, self.CONV1_OUT_CH, self.CONV1_K, self.STRIDE, self.CONV1_PAD)
         self.bn1 = nn.BatchNorm2d(self.CONV1_OUT_CH)
-        self.conv2 = nn.Conv2d(self.CONV1_OUT_CH, self.CONV2_OUT_CH, kernel_size=self.KERNEL, stride=self.STRIDE, padding=self.PAD)
+        self.conv2 = nn.Conv2d(self.CONV1_OUT_CH, self.CONV2_OUT_CH, self.KERNEL, self.STRIDE, self.PAD)
         self.bn2 = nn.BatchNorm2d(self.CONV2_OUT_CH)
-        self.conv3 = nn.Conv2d(self.CONV2_OUT_CH, self.CONV3_OUT_CH, kernel_size=self.KERNEL, stride=self.STRIDE, padding=self.PAD)
+        self.conv3 = nn.Conv2d(self.CONV2_OUT_CH, self.CONV3_OUT_CH, self.KERNEL, self.STRIDE, self.PAD)
         self.bn3 = nn.BatchNorm2d(self.CONV3_OUT_CH)
         self.pool = nn.AdaptiveAvgPool2d((self.POOL_H, self.POOL_W))
-        self.drop1 = nn.Dropout(0.3)
-        self.fc1 = nn.Linear(self.CONV3_OUT_CH * self.POOL_H * self.POOL_W, self.FC1_OUT)
-        self.drop2 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(self.FC1_OUT, num_classes)
+        feat_dim = self.CONV3_OUT_CH * self.POOL_H * self.POOL_W + 1
+        self.drop_cls  = nn.Dropout(0.3);  self.drop_cls2 = nn.Dropout(0.2)
+        self.fc_cls1   = nn.Linear(feat_dim, self.FC1_OUT)
+        self.fc_cls2   = nn.Linear(self.FC1_OUT, num_classes)
+        self.drop_reg  = nn.Dropout(0.3);  self.drop_reg2 = nn.Dropout(0.2)
+        self.fc_reg1   = nn.Linear(feat_dim, self.FC1_OUT)
+        self.fc_reg2   = nn.Linear(self.FC1_OUT, 4)
 
     def forward(self, x):
+        star_density = x.mean(dim=[2, 3])
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
         x = torch.flatten(x, 1)
-        x = self.drop1(x)
-        x = F.relu(self.fc1(x))
-        x = self.drop2(x)
-        x = self.fc2(x)
-        return x
+        x = torch.cat([x, star_density], dim=1)
+        cls = F.relu(self.fc_cls1(self.drop_cls(x)))
+        cls_logits = self.fc_cls2(self.drop_cls2(cls))
+        reg = F.relu(self.fc_reg1(self.drop_reg(x)))
+        quat = F.normalize(self.fc_reg2(self.drop_reg2(reg)), dim=1)
+        return cls_logits, quat
 
 
 def load_model(manifest_path, device):
-    """Load trained CNN model from manifest."""
-    models_dir = manifest_path.parent
-    manifest_path_obj = manifest_path if isinstance(manifest_path, Path) else Path(manifest_path)
-    
-    with open(manifest_path_obj, "r", encoding="utf-8") as f:
+    """Load trained dual-head CNN and calibration temperature from manifest."""
+    models_dir = Path(manifest_path).parent
+    with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
-    
+
     model_name = manifest["artifacts"]["weights_pth"]
     model_path = models_dir / model_name
-    
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
+
     model = StarTrackerTinyCNN(num_classes=6).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
-    return model
+
+    temperature = float(manifest.get("temperature", 1.0))
+    return model, temperature
 
 
-def render_interactive(manifest, star_catalog, model, device, camera_width=640, camera_height=480, model_width=160, model_height=120):
+def render_interactive(manifest, star_catalog, model, temperature, device,
+                       camera_width=640, camera_height=480,
+                       model_width=160, model_height=120):
     """
     Interactive viewer with sliders for pitch/roll/yaw/fov and real-time CNN inference.
     
@@ -284,7 +297,7 @@ def render_interactive(manifest, star_catalog, model, device, camera_width=640, 
     ax_img.axis("off")
     
     # Compact prediction text area at lower-right, away from the main image.
-    ax_text = fig.add_axes([0.73, 0.06, 0.25, 0.15])
+    ax_text = fig.add_axes([0.70, 0.04, 0.28, 0.22])
     ax_text.axis("off")
     text_display = ax_text.text(0.1, 0.9, "", transform=ax_text.transAxes, fontsize=11, verticalalignment="top",
                                  family="monospace", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
@@ -301,56 +314,71 @@ def render_interactive(manifest, star_catalog, model, device, camera_width=640, 
     slider_fov = widgets.Slider(ax_fov, "FOV (°)", 30, 120, valinit=fov_x_default, color="purple")
     
     def update_view(val):
-        """Callback: re-render image and run inference."""
-        yaw_deg = slider_yaw.val
+        yaw_deg   = slider_yaw.val
         pitch_deg = slider_pitch.val
-        roll_deg = slider_roll.val
+        roll_deg  = slider_roll.val
         fov_x_deg = slider_fov.val
-        
-        yaw = np.radians(yaw_deg)
-        pitch = np.radians(pitch_deg)
-        roll = np.radians(roll_deg)
-        
-        # Render star field at 640x480
+
         img_full = render_star_camera(
             star_catalog=star_catalog,
-            yaw=yaw,
-            pitch=pitch,
-            roll=roll,
-            img_width=camera_width,
-            img_height=camera_height,
-            fov_x_degrees=fov_x_deg,
-            psf_sigma=psf_sigma,
+            yaw=np.radians(yaw_deg), pitch=np.radians(pitch_deg),
+            roll=np.radians(roll_deg), img_width=camera_width,
+            img_height=camera_height, fov_x_degrees=fov_x_deg, psf_sigma=psf_sigma,
         )
-        
-        # Update display image
         im.set_data(img_full)
-        
-        # Downscale to model resolution for inference
-        img_torch = torch.from_numpy(img_full).unsqueeze(0).unsqueeze(0).to(device)
-        img_resized = F.interpolate(img_torch, size=(model_height, model_width), mode="bilinear", align_corners=False)
-        
-        # Run inference
+
+        img_t = torch.from_numpy(img_full).unsqueeze(0).unsqueeze(0).to(device)
+        img_r = F.interpolate(img_t, size=(model_height, model_width),
+                               mode="bilinear", align_corners=False)
+
         with torch.no_grad():
-            logits = model(img_resized)
-            probs = torch.softmax(logits, dim=1)
-        
-        pred_class = torch.argmax(logits, dim=1).item()
-        pred_conf = probs[0, pred_class].item() * 100
-        
-        # Update text display
-        text_lines = [
-            f"Attitude:\n",
-            f"  Yaw:   {yaw_deg:+7.1f}°\n",
-            f"  Pitch: {pitch_deg:+7.1f}°\n",
-            f"  Roll:  {roll_deg:+7.1f}°\n",
-            f"  FOV:   {fov_x_deg:7.1f}°\n\n",
-            f"Prediction:\n",
-            f"  Class: {CLASS_NAMES[pred_class]} ({pred_class})\n",
-            f"  Confidence: {pred_conf:.1f}%\n",
+            cls_logits, q_pred = model(img_r)
+            probs = torch.softmax(cls_logits / temperature, dim=1)
+
+        pred_cls  = int(torch.argmax(cls_logits, dim=1).item())
+        pred_conf = float(probs[0, pred_cls].item()) * 100.0
+        q_np      = q_pred[0].cpu().numpy()
+
+        cnn_yaw, cnn_pitch, cnn_roll = quaternion_to_euler_deg(q_np)
+
+        # Ground-truth quaternion from sliders for angular error
+        def euler_to_quat(y_d, p_d, r_d):
+            y, p, r = np.radians(y_d), np.radians(p_d), np.radians(r_d)
+            cy, sy = np.cos(y / 2), np.sin(y / 2)
+            cp, sp = np.cos(p / 2), np.sin(p / 2)
+            cr, sr = np.cos(r / 2), np.sin(r / 2)
+            return np.array([
+                cr * cp * cy + sr * sp * sy,
+                sr * cp * cy - cr * sp * sy,
+                cr * sp * cy + sr * cp * sy,
+                cr * cp * sy - sr * sp * cy,
+            ], dtype=np.float32)
+
+        q_true  = euler_to_quat(yaw_deg, pitch_deg, roll_deg)
+        dot     = abs(float(np.dot(q_np, q_true)))
+        ang_err = float(np.degrees(2.0 * np.arccos(min(dot, 1.0))))
+
+        star_count_est = int((img_full > 0.15).sum())
+
+        lines = [
+            f"━━  CLASSIFICATION  ━━\n",
+            f"  Class:   {CLASS_NAMES[pred_cls]} ({pred_cls})\n",
+            f"  Conf:    {pred_conf:5.1f}%  (T={temperature:.2f})\n\n",
+            f"━━  QUATERNION  ━━\n",
+            f"  w={q_np[0]:+.4f}\n",
+            f"  x={q_np[1]:+.4f}\n",
+            f"  y={q_np[2]:+.4f}\n",
+            f"  z={q_np[3]:+.4f}\n\n",
+            f"━━  CNN EULER (deg)  ━━\n",
+            f"  Yaw:   {cnn_yaw:+7.2f}°\n",
+            f"  Pitch: {cnn_pitch:+7.2f}°\n",
+            f"  Roll:  {cnn_roll:+7.2f}°\n\n",
+            f"━━  ERROR  ━━\n",
+            f"  Angular: {ang_err:5.2f}°\n\n",
+            f"━━  STAR COUNT  ━━\n",
+            f"  Pixels>0.15: {star_count_est}\n",
         ]
-        text_display.set_text("".join(text_lines))
-        
+        text_display.set_text("".join(lines))
         fig.canvas.draw_idle()
     
     # Connect slider callbacks
@@ -387,8 +415,8 @@ if __name__ == "__main__":
             device = torch.device("mps")
         else:
             device = torch.device("cpu")
-        model = load_model(manifest_path, device)
-        render_interactive(manifest, star_catalog, model, device)
+        model, temperature = load_model(manifest_path, device)
+        render_interactive(manifest, star_catalog, model, temperature, device)
     else:
         output_path = Path(args.output) if args.output else None
         render_view(manifest=manifest, star_catalog=star_catalog, output_path=output_path)
