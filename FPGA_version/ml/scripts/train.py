@@ -17,6 +17,7 @@ from datetime import datetime
 from math import atan, tan
 from pathlib import Path
 import json
+import os
 import random
 
 import numpy as np
@@ -53,12 +54,85 @@ CLASS_NAMES = {
 }
 
 
-# Tiny CNN chosen to keep HLS header and compute footprint manageable.
-CNN_CONV1_OUT_CH = 8
-CNN_CONV2_OUT_CH = 16
-CNN_KERNEL = 3
+def rotation_matrix_to_quaternion(R):
+    """Convert 3×3 rotation matrix to unit quaternion [w, x, y, z]."""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float32)
+
+
+def quaternion_to_euler_deg(q):
+    """Convert unit quaternion [w,x,y,z] to (yaw, pitch, roll) in degrees.
+    Uses ZYX aerospace convention matching get_rotation_matrix in this file.
+    """
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    sinr = 2.0 * (w * x + y * z)
+    cosr = 1.0 - 2.0 * (x * x + y * y)
+    roll  = np.degrees(np.arctan2(sinr, cosr))
+    sinp  = 2.0 * (w * y - z * x)
+    pitch = np.degrees(np.arcsin(np.clip(sinp, -1.0, 1.0)))
+    siny  = 2.0 * (w * z + x * y)
+    cosy  = 1.0 - 2.0 * (y * y + z * z)
+    yaw   = np.degrees(np.arctan2(siny, cosy))
+    return float(yaw), float(pitch), float(roll)
+
+
+def angular_error_deg_batch(q_pred, q_true):
+    """Per-sample angular error in degrees between two batches of unit quaternions.
+    Handles double-cover: q and -q represent the same rotation.
+    q_pred, q_true: torch tensors shape (B, 4)
+    Returns: tensor shape (B,) with error in degrees.
+    """
+    dot = (q_pred * q_true).sum(dim=1).abs().clamp(0.0, 1.0)
+    return 2.0 * torch.acos(dot) * (180.0 / torch.pi)
+
+
+def geodesic_loss(q_pred, q_true):
+    """Quaternion geodesic loss: 0 when identical, 1 when orthogonal.
+    Handles double-cover (q == -q) by taking abs of dot product.
+    q_pred, q_true: (B, 4) unit quaternions
+    """
+    dot = (q_pred * q_true).sum(dim=1).abs().clamp(0.0, 1.0)
+    return (1.0 - dot).mean()
+
+
+# CNN architecture — balanced for both accuracy and FPGA feasibility.
+CNN_CONV1_OUT_CH = 16
+CNN_CONV1_KERNEL = 5    # larger receptive field for conv1
+CNN_CONV1_PAD = 2       # keeps 160→80 with stride 2
+CNN_CONV2_OUT_CH = 32
+CNN_CONV3_OUT_CH = 64
+CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
+# After conv1(s=2): 80×60; conv2(s=2): 40×30; conv3(s=2): 20×15
+# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 64×3×5=960 features
+CNN_POOL_H = 3
+CNN_POOL_W = 5
+CNN_FC1_OUT = 128
 
 
 def make_star_catalog(num_stars=NUM_STARS, seed=UNIVERSE_SEED):
@@ -144,26 +218,30 @@ def render_star_camera(
     rotated_xyz = rotated_xyz[in_front_mask]
     magnitudes = star_catalog[in_front_mask, 3]
 
-    # Project each star and apply PSF blurring
-    for (x, y, z), magnitude in zip(rotated_xyz, magnitudes):
-        u_float = (fx * x / z) + cx
-        v_float = (fy * y / z) + cy
-        
-        # Apply Gaussian PSF by spreading magnitude over nearby pixels
-        u_center = int(np.round(u_float))
-        v_center = int(np.round(v_float))
-        
-        psf_kernel_size = int(np.ceil(3 * psf_sigma))
-        for du in range(-psf_kernel_size, psf_kernel_size + 1):
-            for dv in range(-psf_kernel_size, psf_kernel_size + 1):
-                u = u_center + du
-                v = v_center + dv
-                
-                if 0 <= u < img_width and 0 <= v < img_height:
-                    # Gaussian PSF: weight decreases with distance from center
-                    dist_sq = (u_float - u)**2 + (v_float - v)**2
-                    psf_weight = np.exp(-dist_sq / (2 * psf_sigma**2))
-                    img[v, u] += magnitude * psf_weight
+    # Vectorized PSF: compute all star projections at once
+    u_float = (fx * rotated_xyz[:, 0] / rotated_xyz[:, 2]) + cx  # (N,)
+    v_float = (fy * rotated_xyz[:, 1] / rotated_xyz[:, 2]) + cy  # (N,)
+
+    psf_kernel_size = int(np.ceil(3 * psf_sigma))
+    offsets = np.arange(-psf_kernel_size, psf_kernel_size + 1)
+    du, dv = np.meshgrid(offsets, offsets)
+    du = du.flatten()  # (K²,)
+    dv = dv.flatten()  # (K²,)
+
+    u_center = np.round(u_float).astype(np.int32)  # (N,)
+    v_center = np.round(v_float).astype(np.int32)  # (N,)
+
+    # (N, K²) pixel coordinates
+    u_pix = u_center[:, None] + du[None, :]
+    v_pix = v_center[:, None] + dv[None, :]
+
+    dist_sq = (u_float[:, None] - u_pix) ** 2 + (v_float[:, None] - v_pix) ** 2
+    psf_weight = np.exp(-dist_sq / (2 * psf_sigma ** 2))  # (N, K²)
+
+    contributions = magnitudes[:, None] * psf_weight  # (N, K²)
+
+    valid = (u_pix >= 0) & (u_pix < img_width) & (v_pix >= 0) & (v_pix < img_height)
+    np.add.at(img, (v_pix[valid], u_pix[valid]), contributions[valid])
 
     return np.clip(img, 0.0, 1.0)
 
@@ -209,6 +287,12 @@ def generate_labeled_sample(
         psf_sigma=psf_sigma,
     )
 
+    # Max-normalize: sparse star images have very low raw pixel values.
+    # Without this, most of the [0,1] range is unused and gradients starve.
+    max_val = img_np.max()
+    if max_val > 1e-6:
+        img_np = img_np / max_val
+
     img = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0)
 
     if (model_height, model_width) != (camera_height, camera_width):
@@ -226,14 +310,19 @@ def generate_labeled_sample(
         noise = torch.normal(0, noise_prob, size=img.shape)
         img = torch.clamp(img + noise, 0.0, 1.0)
 
+    # Build ground-truth quaternion from the actual rotation applied
+    R = get_rotation_matrix(yaw, pitch, roll)
+    quaternion = rotation_matrix_to_quaternion(R)  # [w, x, y, z]
+
     metadata = {
         "class_id": int(class_id),
         "class_name": CLASS_NAMES[int(class_id)],
         "yaw_deg": float(yaw_deg),
         "pitch_deg": float(pitch_deg),
         "roll_deg": float(roll_deg),
+        "quaternion": quaternion.tolist(),
     }
-    return img, metadata
+    return img, quaternion, metadata
 
 
 class StarTrackerSyntheticDataset(Dataset):
@@ -276,13 +365,13 @@ class StarTrackerSyntheticDataset(Dataset):
         self.class_ids = rng.integers(0, NUM_CLASSES, size=num_samples, endpoint=False)
         self.sample_seeds = rng.integers(0, 2**31 - 1, size=num_samples)
 
-        self.cached_images = None
         if self.cache_samples:
             cached_images = []
+            cached_quats = []
             for idx in range(self.num_samples):
                 class_id = int(self.class_ids[idx])
                 sample_rng = np.random.default_rng(int(self.sample_seeds[idx]))
-                img, _meta = generate_labeled_sample(
+                img, quat, _meta = generate_labeled_sample(
                     class_id=class_id,
                     star_catalog=self.star_catalog,
                     jitter_degrees=self.jitter_degrees,
@@ -296,7 +385,12 @@ class StarTrackerSyntheticDataset(Dataset):
                     psf_sigma=self.psf_sigma,
                 )
                 cached_images.append(img)
+                cached_quats.append(torch.from_numpy(quat))
             self.cached_images = torch.stack(cached_images, dim=0)
+            self.cached_quats = torch.stack(cached_quats, dim=0)
+        else:
+            self.cached_images = None
+            self.cached_quats = None
 
     def __len__(self):
         return self.num_samples
@@ -305,9 +399,10 @@ class StarTrackerSyntheticDataset(Dataset):
         class_id = int(self.class_ids[idx])
         if self.cached_images is not None:
             img = self.cached_images[idx]
+            quat = self.cached_quats[idx]
         else:
             sample_rng = np.random.default_rng(int(self.sample_seeds[idx]))
-            img, _meta = generate_labeled_sample(
+            img, quat_np, _meta = generate_labeled_sample(
                 class_id=class_id,
                 star_catalog=self.star_catalog,
                 jitter_degrees=self.jitter_degrees,
@@ -320,54 +415,150 @@ class StarTrackerSyntheticDataset(Dataset):
                 rng=sample_rng,
                 psf_sigma=self.psf_sigma,
             )
-        return img, class_id
+            quat = torch.from_numpy(quat_np)
+        return img, class_id, quat
 
 
 class StarTrackerTinyCNN(nn.Module):
     """
-    Minimal CNN designed to balance accuracy with hardware friendliness.
+    Dual-head CNN: shared backbone → classification head + quaternion regression head.
 
-    Architecture: Conv -> ReLU -> Conv -> ReLU -> Global Average Pool -> Linear.
-    This avoids a very large fully-connected layer on raw 640x480 pixels.
+    Star count injection:
+      Mean pixel brightness of the input image is appended to the 960 pooled features
+      before both FC heads. This lets the network learn that sparse-star frames carry
+      less attitude information (differentiable proxy for visible star count).
+
+    Classification head  → 6-class coarse direction (for FPGA / HLS export)
+    Quaternion head      → unit quaternion [w,x,y,z] (for ARM PS / precise attitude)
+
+    BatchNorm is trained here but folded into conv weights at HLS export time.
     """
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, CNN_CONV1_OUT_CH, kernel_size=CNN_KERNEL, stride=CNN_STRIDE, padding=CNN_PAD)
-        self.conv2 = nn.Conv2d(CNN_CONV1_OUT_CH, CNN_CONV2_OUT_CH, kernel_size=CNN_KERNEL, stride=CNN_STRIDE, padding=CNN_PAD)
-        self.relu = nn.ReLU()
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(CNN_CONV2_OUT_CH, num_classes)
+        # Backbone
+        self.conv1 = nn.Conv2d(1, CNN_CONV1_OUT_CH, kernel_size=CNN_CONV1_KERNEL,
+                               stride=CNN_STRIDE, padding=CNN_CONV1_PAD)
+        self.bn1 = nn.BatchNorm2d(CNN_CONV1_OUT_CH)
+        self.conv2 = nn.Conv2d(CNN_CONV1_OUT_CH, CNN_CONV2_OUT_CH, kernel_size=CNN_KERNEL,
+                               stride=CNN_STRIDE, padding=CNN_PAD)
+        self.bn2 = nn.BatchNorm2d(CNN_CONV2_OUT_CH)
+        self.conv3 = nn.Conv2d(CNN_CONV2_OUT_CH, CNN_CONV3_OUT_CH, kernel_size=CNN_KERNEL,
+                               stride=CNN_STRIDE, padding=CNN_PAD)
+        self.bn3 = nn.BatchNorm2d(CNN_CONV3_OUT_CH)
+        self.pool = nn.AdaptiveAvgPool2d((CNN_POOL_H, CNN_POOL_W))
+
+        feat_dim = CNN_CONV3_OUT_CH * CNN_POOL_H * CNN_POOL_W + 1  # +1 for star_density
+
+        # Classification head
+        self.drop_cls = nn.Dropout(0.3)
+        self.fc_cls1 = nn.Linear(feat_dim, CNN_FC1_OUT)
+        self.drop_cls2 = nn.Dropout(0.2)
+        self.fc_cls2 = nn.Linear(CNN_FC1_OUT, num_classes)
+
+        # Quaternion regression head
+        self.drop_reg = nn.Dropout(0.3)
+        self.fc_reg1 = nn.Linear(feat_dim, CNN_FC1_OUT)
+        self.drop_reg2 = nn.Dropout(0.2)
+        self.fc_reg2 = nn.Linear(CNN_FC1_OUT, 4)
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
+        # Star density feature: mean brightness = differentiable proxy for star count
+        star_density = x.mean(dim=[2, 3])  # [B, 1]
+
+        # Backbone
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-        return x
+        x = torch.flatten(x, 1)               # [B, 960]
+
+        # Inject star density
+        x = torch.cat([x, star_density], dim=1)  # [B, 961]
+
+        # Classification head
+        cls = self.drop_cls(x)
+        cls = F.relu(self.fc_cls1(cls))
+        cls = self.drop_cls2(cls)
+        cls_logits = self.fc_cls2(cls)          # [B, 6]
+
+        # Quaternion head (unit-normalized output)
+        reg = self.drop_reg(x)
+        reg = F.relu(self.fc_reg1(reg))
+        reg = self.drop_reg2(reg)
+        quat = F.normalize(self.fc_reg2(reg), dim=1)  # [B, 4]
+
+        return cls_logits, quat
+
+    def forward_cls_only(self, x):
+        """Classification-only path used at HLS export time (no regression overhead)."""
+        cls_logits, _ = self.forward(x)
+        return cls_logits
 
 
-def evaluate(model, loader, criterion, device):
-    """Compute validation loss/accuracy without gradient updates."""
+def evaluate(model, loader, criterion, device, reg_lambda=0.5):
+    """Compute validation loss, classification accuracy, and mean angular error."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
+    angle_errors = []
 
     with torch.no_grad():
-        for images, labels in loader:
+        for images, labels, quats in loader:
             images = images.to(device)
             labels = labels.to(device)
+            quats  = quats.to(device)
 
-            logits = model(images)
-            loss = criterion(logits, labels)
+            cls_logits, q_pred = model(images)
+
+            cls_loss = criterion(cls_logits, labels)
+            reg_loss = geodesic_loss(q_pred, quats)
+            loss = cls_loss + reg_lambda * reg_loss
+
             running_loss += loss.item() * labels.size(0)
-
-            preds = torch.argmax(logits, dim=1)
+            preds = torch.argmax(cls_logits, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-    return running_loss / total, 100.0 * correct / total
+            errs = angular_error_deg_batch(q_pred, quats)
+            angle_errors.append(errs.cpu())
+
+    mean_angle_err = torch.cat(angle_errors).mean().item()
+    return running_loss / total, 100.0 * correct / total, mean_angle_err
+
+
+def calibrate_temperature(model, val_loader, device):
+    """
+    Find scalar temperature T that minimises NLL on the validation set.
+    After calibration, softmax(logits / T) gives well-calibrated probabilities.
+    Returns T as a Python float (stored in manifest for inference-time use).
+    """
+    model.eval()
+    logits_all, labels_all = [], []
+    with torch.no_grad():
+        for images, labels, _quats in val_loader:
+            cls_logits, _ = model(images.to(device))
+            logits_all.append(cls_logits.cpu())
+            labels_all.append(labels)
+
+    logits = torch.cat(logits_all)
+    labels = torch.cat(labels_all)
+
+    T = nn.Parameter(torch.ones(1))
+    opt = optim.LBFGS([T], lr=0.01, max_iter=500)
+    criterion = nn.CrossEntropyLoss()
+
+    def closure():
+        opt.zero_grad()
+        loss = criterion(logits / T.clamp(min=1e-3), labels)
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    T_val = float(T.item())
+    print(f"Calibrated temperature T = {T_val:.4f}  "
+          f"(>1 → model was overconfident, <1 → underconfident)")
+    return T_val
 
 
 def quantize_array(array, frac_bits):
@@ -390,31 +581,66 @@ def write_flat_array(f, name, array, elements_per_line=24):
     f.write("\n};\n\n")
 
 
+def fold_bn_into_conv(conv_w, conv_b, bn_mean, bn_var, bn_gamma, bn_beta, bn_eps=1e-5):
+    """Fold BatchNorm parameters into the preceding conv layer for hardware export.
+
+    After folding, the HLS kernel only needs conv+bias — no separate BN stage.
+    Math: BN(W*x+b) = scale*(W*x + b - mean) + beta
+          = (scale*W)*x + (scale*(b-mean) + beta)   where scale = gamma/sqrt(var+eps)
+    """
+    scale = bn_gamma / np.sqrt(bn_var + bn_eps)       # (out_ch,)
+    folded_w = conv_w * scale[:, None, None, None]
+    folded_b = (conv_b - bn_mean) * scale + bn_beta
+    return folded_w, folded_b
+
+
 def export_to_hls_header(model, output_header_path, frac_bits, model_width, model_height, catalog_seed):
     """
     Export trained CNN parameters to a C header consumed by HLS C++ inference.
 
-    Export format intentionally includes network shape macros and seed metadata so the
-    generated header can be traced back to the starscape that created the model.
+    BatchNorm layers are folded into conv weights at export time so the hardware
+    kernel implements only conv+bias. The generated header encodes all shape macros
+    and the catalog seed so it can be traced back to the run that produced it.
     """
-    model_cpu = model.cpu()
+    model_cpu = model.cpu().eval()
 
-    conv1_w = model_cpu.conv1.weight.detach().numpy()
-    conv1_b = model_cpu.conv1.bias.detach().numpy()
-    conv2_w = model_cpu.conv2.weight.detach().numpy()
-    conv2_b = model_cpu.conv2.bias.detach().numpy()
-    fc_w = model_cpu.fc.weight.detach().numpy()
-    fc_b = model_cpu.fc.bias.detach().numpy()
+    def get_np(param):
+        return param.detach().numpy()
 
-    conv1_w_q = quantize_array(conv1_w, frac_bits)
-    conv1_b_q = quantize_array(conv1_b, frac_bits)
-    conv2_w_q = quantize_array(conv2_w, frac_bits)
-    conv2_b_q = quantize_array(conv2_b, frac_bits)
-    fc_w_q = quantize_array(fc_w, frac_bits)
-    fc_b_q = quantize_array(fc_b, frac_bits)
+    # Fold BN into conv weights
+    c1w, c1b = fold_bn_into_conv(
+        get_np(model_cpu.conv1.weight), get_np(model_cpu.conv1.bias),
+        get_np(model_cpu.bn1.running_mean), get_np(model_cpu.bn1.running_var),
+        get_np(model_cpu.bn1.weight), get_np(model_cpu.bn1.bias),
+    )
+    c2w, c2b = fold_bn_into_conv(
+        get_np(model_cpu.conv2.weight), get_np(model_cpu.conv2.bias),
+        get_np(model_cpu.bn2.running_mean), get_np(model_cpu.bn2.running_var),
+        get_np(model_cpu.bn2.weight), get_np(model_cpu.bn2.bias),
+    )
+    c3w, c3b = fold_bn_into_conv(
+        get_np(model_cpu.conv3.weight), get_np(model_cpu.conv3.bias),
+        get_np(model_cpu.bn3.running_mean), get_np(model_cpu.bn3.running_var),
+        get_np(model_cpu.bn3.weight), get_np(model_cpu.bn3.bias),
+    )
+    fc1_w = get_np(model_cpu.fc_cls1.weight)
+    fc1_b = get_np(model_cpu.fc_cls1.bias)
+    fc2_w = get_np(model_cpu.fc_cls2.weight)
+    fc2_b = get_np(model_cpu.fc_cls2.bias)
+
+    c1w_q  = quantize_array(c1w,  frac_bits)
+    c1b_q  = quantize_array(c1b,  frac_bits)
+    c2w_q  = quantize_array(c2w,  frac_bits)
+    c2b_q  = quantize_array(c2b,  frac_bits)
+    c3w_q  = quantize_array(c3w,  frac_bits)
+    c3b_q  = quantize_array(c3b,  frac_bits)
+    fc1w_q = quantize_array(fc1_w, frac_bits)
+    fc1b_q = quantize_array(fc1_b, frac_bits)
+    fc2w_q = quantize_array(fc2_w, frac_bits)
+    fc2b_q = quantize_array(fc2_b, frac_bits)
 
     with open(output_header_path, "w", encoding="utf-8") as f:
-        f.write("// Auto-generated header file for Star Tracker Tiny CNN weights\n")
+        f.write("// Auto-generated header: Star Tracker CNN weights (BN folded into conv)\n")
         f.write(f"// Scale factor: {1 << frac_bits} (fixed-point)\n")
         f.write(f"// Star catalog seed: {catalog_seed}\n\n")
 
@@ -427,139 +653,210 @@ def export_to_hls_header(model, output_header_path, frac_bits, model_width, mode
         f.write("typedef int weight_storage_t;\n")
         f.write("#endif\n\n")
 
-        f.write("#define ST_INPUT_WIDTH {}\n".format(model_width))
-        f.write("#define ST_INPUT_HEIGHT {}\n".format(model_height))
-        f.write("#define ST_NUM_CLASSES {}\n".format(NUM_CLASSES))
-        f.write("#define ST_FRAC_BITS {}\n".format(frac_bits))
-        f.write("#define ST_CATALOG_SEED {}\n\n".format(catalog_seed))
+        f.write(f"#define ST_INPUT_WIDTH {model_width}\n")
+        f.write(f"#define ST_INPUT_HEIGHT {model_height}\n")
+        f.write(f"#define ST_NUM_CLASSES {NUM_CLASSES}\n")
+        f.write(f"#define ST_FRAC_BITS {frac_bits}\n")
+        f.write(f"#define ST_CATALOG_SEED {catalog_seed}\n\n")
 
-        f.write("#define ST_CONV1_IN_CH 1\n")
-        f.write("#define ST_CONV1_OUT_CH {}\n".format(CNN_CONV1_OUT_CH))
-        f.write("#define ST_CONV1_K {}\n".format(CNN_KERNEL))
-        f.write("#define ST_CONV1_STRIDE {}\n".format(CNN_STRIDE))
-        f.write("#define ST_CONV1_PAD {}\n\n".format(CNN_PAD))
+        f.write(f"#define ST_CONV1_IN_CH 1\n")
+        f.write(f"#define ST_CONV1_OUT_CH {CNN_CONV1_OUT_CH}\n")
+        f.write(f"#define ST_CONV1_K {CNN_CONV1_KERNEL}\n")
+        f.write(f"#define ST_CONV1_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV1_PAD {CNN_CONV1_PAD}\n\n")
 
-        f.write("#define ST_CONV2_IN_CH {}\n".format(CNN_CONV1_OUT_CH))
-        f.write("#define ST_CONV2_OUT_CH {}\n".format(CNN_CONV2_OUT_CH))
-        f.write("#define ST_CONV2_K {}\n".format(CNN_KERNEL))
-        f.write("#define ST_CONV2_STRIDE {}\n".format(CNN_STRIDE))
-        f.write("#define ST_CONV2_PAD {}\n\n".format(CNN_PAD))
+        f.write(f"#define ST_CONV2_IN_CH {CNN_CONV1_OUT_CH}\n")
+        f.write(f"#define ST_CONV2_OUT_CH {CNN_CONV2_OUT_CH}\n")
+        f.write(f"#define ST_CONV2_K {CNN_KERNEL}\n")
+        f.write(f"#define ST_CONV2_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV2_PAD {CNN_PAD}\n\n")
 
-        write_flat_array(f, "conv1_w", conv1_w_q)
-        write_flat_array(f, "conv1_b", conv1_b_q)
-        write_flat_array(f, "conv2_w", conv2_w_q)
-        write_flat_array(f, "conv2_b", conv2_b_q)
-        write_flat_array(f, "fc_w", fc_w_q)
-        write_flat_array(f, "fc_b", fc_b_q)
+        f.write(f"#define ST_CONV3_IN_CH {CNN_CONV2_OUT_CH}\n")
+        f.write(f"#define ST_CONV3_OUT_CH {CNN_CONV3_OUT_CH}\n")
+        f.write(f"#define ST_CONV3_K {CNN_KERNEL}\n")
+        f.write(f"#define ST_CONV3_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV3_PAD {CNN_PAD}\n\n")
+
+        f.write(f"#define ST_POOL_H {CNN_POOL_H}\n")
+        f.write(f"#define ST_POOL_W {CNN_POOL_W}\n\n")
+
+        f.write(f"#define ST_FC1_IN  ({CNN_CONV3_OUT_CH} * {CNN_POOL_H} * {CNN_POOL_W} + 1)\n")
+        f.write(f"#define ST_FC1_OUT {CNN_FC1_OUT}\n\n")
+
+        write_flat_array(f, "conv1_w", c1w_q)
+        write_flat_array(f, "conv1_b", c1b_q)
+        write_flat_array(f, "conv2_w", c2w_q)
+        write_flat_array(f, "conv2_b", c2b_q)
+        write_flat_array(f, "conv3_w", c3w_q)
+        write_flat_array(f, "conv3_b", c3b_q)
+        write_flat_array(f, "fc1_w",   fc1w_q)
+        write_flat_array(f, "fc1_b",   fc1b_q)
+        write_flat_array(f, "fc2_w",   fc2w_q)
+        write_flat_array(f, "fc2_b",   fc2b_q)
 
         f.write("#endif // STAR_TRACKER_WEIGHTS_H\n")
 
 
 def train_model(
-    num_samples=4000,
-    num_epochs=60,
-    batch_size=64,
-    learning_rate=5e-3,
+    num_samples=12000,
+    num_epochs=100,
+    batch_size=128,
+    learning_rate=3e-3,
     camera_width=640,
     camera_height=480,
     model_width=160,
     model_height=120,
     fov_x_degrees=62.0,
-    jitter_degrees=10.0,
     noise_prob=0.02,
     psf_sigma=1.5,
-    cache_samples=True,
+    reg_lambda=0.5,
     dataset_seed=42,
     catalog_seed=UNIVERSE_SEED,
+    cache_samples=True,
+    num_workers=None,
+    device=None,
 ):
     """
-    Train the tiny CNN on synthetic star-camera images with improved realism.
+    Train the dual-head CNN with curriculum learning.
 
-    Improvements:
-    - Uses magnitude-based star brightness for texture information
-    - Applies PSF blurring to simulate camera optics
-    - Larger batch size (64) for more stable gradient estimates and fewer steps per epoch
-    - Higher learning rate (5e-3) with decay schedule
-    - More training epochs (60) to allow convergence
-    - Gaussian noise on continuous intensity values
-    - Optional dataset caching to avoid re-rendering samples every epoch
+    Curriculum phases (split equally across num_epochs):
+      Phase 1 — jitter=3°:  model sees tightly clustered classes, learns coarse features.
+      Phase 2 — jitter=8°:  moderate overlap, refines decision boundaries.
+      Phase 3 — jitter=15°: heavy overlap, forces robust quaternion regression.
+
+    Combined loss: CrossEntropy(class) + reg_lambda * GeodesicLoss(quaternion)
+    Returns: (model, star_catalog, val_loader) — val_loader used for temperature calibration.
     """
+    CURRICULUM_JITTERS = [3.0, 8.0, 15.0]
+    phase_len = num_epochs // 3
+
     star_catalog = make_star_catalog(num_stars=NUM_STARS, seed=catalog_seed)
 
-    print("Generating synthetic 3D-projected star fields...")
-    print(f"Camera resolution: {camera_width}x{camera_height}")
-    print(f"Model resolution:  {model_width}x{model_height}")
-    print(f"Star catalog size: {star_catalog.shape[0]} stars")
-    print(f"PSF sigma: {psf_sigma}, Jitter: {jitter_degrees}°, Noise: {noise_prob}")
+    print("Building curriculum datasets (3 phases)...")
+    datasets = []
+    for jitter in CURRICULUM_JITTERS:
+        print(f"  Generating dataset jitter={jitter}°  ({num_samples} samples)...")
+        ds = StarTrackerSyntheticDataset(
+            num_samples=num_samples,
+            star_catalog=star_catalog,
+            camera_width=camera_width,
+            camera_height=camera_height,
+            model_width=model_width,
+            model_height=model_height,
+            jitter_degrees=jitter,
+            noise_prob=noise_prob,
+            fov_x_degrees=fov_x_degrees,
+            psf_sigma=psf_sigma,
+            cache_samples=cache_samples,
+            seed=dataset_seed + int(jitter * 10),
+        )
+        datasets.append(ds)
 
-    dataset = StarTrackerSyntheticDataset(
-        num_samples=num_samples,
-        star_catalog=star_catalog,
-        camera_width=camera_width,
-        camera_height=camera_height,
-        model_width=model_width,
-        model_height=model_height,
-        jitter_degrees=jitter_degrees,
-        noise_prob=noise_prob,
-        fov_x_degrees=fov_x_degrees,
-        psf_sigma=psf_sigma,
-        cache_samples=cache_samples,
-        seed=dataset_seed,
-    )
+    if num_workers is None:
+        _nw_candidate = min(4, os.cpu_count() or 1)
+        # Probe whether the dataset class is picklable (required for num_workers > 0).
+        # When train.py is exec()'d into a dynamic namespace the class can't be pickled.
+        import pickle as _pickle
+        try:
+            _pickle.dumps(datasets[0])
+            num_workers = _nw_candidate
+        except Exception:
+            num_workers = 0
 
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(7),
-    )
+    def make_loaders(ds):
+        train_size = int(0.8 * len(ds))
+        val_size   = len(ds) - train_size
+        train_ds, val_ds = random_split(
+            ds, [train_size, val_size],
+            generator=torch.Generator().manual_seed(7),
+        )
+        tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                        num_workers=num_workers, persistent_workers=num_workers > 0)
+        va = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                        num_workers=num_workers, persistent_workers=num_workers > 0)
+        return tr, va
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            # Probe MPS for AdaptiveAvgPool2d support with current spatial dims.
+            # After 3 stride-2 convs: H_feat = ceil(model_height/8), W_feat = ceil(model_width/8).
+            # MPS requires feat dims divisible by pool output dims.
+            h_feat = (model_height + 7) // 8
+            w_feat = (model_width + 7) // 8
+            if h_feat % CNN_POOL_H == 0 and w_feat % CNN_POOL_W == 0:
+                device = torch.device("mps")
+            else:
+                print("MPS AdaptiveAvgPool2d constraint not met "
+                      f"(feat {w_feat}×{h_feat} vs pool {CNN_POOL_W}×{CNN_POOL_H}); "
+                      "falling back to CPU.")
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(device)
+    print(f"Using device: {device}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = StarTrackerTinyCNN(num_classes=NUM_CLASSES).to(device)
-
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
+
+    current_phase = 0
+    train_loader, val_loader = make_loaders(datasets[0])
+    print(f"\n--- Curriculum Phase 1/3  jitter={CURRICULUM_JITTERS[0]}° ---")
 
     for epoch in range(num_epochs):
+        new_phase = min(epoch // phase_len, 2)
+        if new_phase != current_phase:
+            current_phase = new_phase
+            train_loader, val_loader = make_loaders(datasets[current_phase])
+            print(f"\n--- Curriculum Phase {current_phase + 1}/3  "
+                  f"jitter={CURRICULUM_JITTERS[current_phase]}° ---")
+
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
+        angle_errors = []
 
-        for images, labels in train_loader:
+        for images, labels, quats in train_loader:
             images = images.to(device)
             labels = labels.to(device)
+            quats  = quats.to(device)
 
             optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits, labels)
+            cls_logits, q_pred = model(images)
+
+            cls_loss = criterion(cls_logits, labels)
+            reg_loss = geodesic_loss(q_pred, quats)
+            loss = cls_loss + reg_lambda * reg_loss
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item() * labels.size(0)
-            preds = torch.argmax(logits, dim=1)
+            preds = torch.argmax(cls_logits, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+            angle_errors.append(angular_error_deg_batch(q_pred.detach(), quats).cpu())
 
-        train_loss = running_loss / total
-        train_acc = 100.0 * correct / total
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        
         scheduler.step()
 
+        train_loss = running_loss / total
+        train_acc  = 100.0 * correct / total
+        train_ang  = torch.cat(angle_errors).mean().item()
+        val_loss, val_acc, val_ang = evaluate(model, val_loader, criterion, device, reg_lambda)
+
         print(
-            f"Epoch [{epoch + 1}/{num_epochs}] "
-            f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}% | "
-            f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%"
+            f"Epoch [{epoch + 1:3d}/{num_epochs}] "
+            f"Ph{current_phase + 1} "
+            f"Loss:{train_loss:.4f} Acc:{train_acc:.1f}% AngErr:{train_ang:.1f}° | "
+            f"Val Loss:{val_loss:.4f} Acc:{val_acc:.1f}% AngErr:{val_ang:.1f}°"
         )
 
     print("Training complete.")
-    return model, star_catalog
+    return model, star_catalog, val_loader
 
 
 def save_run_artifacts(
@@ -577,6 +874,8 @@ def save_run_artifacts(
     fov_x_degrees,
     jitter_degrees,
     noise_prob,
+    temperature=1.0,
+    reg_lambda=0.5,
 ):
     """
     Persist all outputs from one training run.
@@ -632,6 +931,9 @@ def save_run_artifacts(
         "fov_x_degrees": fov_x_degrees,
         "jitter_degrees": jitter_degrees,
         "noise_prob": noise_prob,
+        "temperature": temperature,
+        "reg_lambda": reg_lambda,
+        "architecture": "dual_head_quaternion_v2",
         "frac_bits": frac_bits,
         "artifacts": {
             "weights_pth": versioned_pth.name,
@@ -653,44 +955,48 @@ def save_run_artifacts(
 
 
 if __name__ == "__main__":
-    # These constants are the practical defaults for your camera + training setup.
-    # Change them here when you want a new experiment configuration.
     random.seed(7)
     np.random.seed(7)
     torch.manual_seed(7)
 
-    camera_width = 640
+    camera_width  = 640
     camera_height = 480
-    model_width = 160
-    model_height = 120
-    frac_bits = 8
-    catalog_seed = UNIVERSE_SEED
-    dataset_seed = 42
+    model_width   = 160
+    model_height  = 120
+    frac_bits     = 8
+    catalog_seed  = UNIVERSE_SEED
+    dataset_seed  = 42
     fov_x_degrees = 62.0
-    jitter_degrees = 10.0
-    noise_prob = 0.01
+    noise_prob    = 0.01
+    reg_lambda    = 0.5
 
-    model, star_catalog = train_model(
-        num_samples=4000,
-        num_epochs=60,
-        batch_size=64,
-        learning_rate=5e-3,
+    model, star_catalog, val_loader = train_model(
+        num_samples=12000,
+        num_epochs=100,
+        batch_size=128,
+        learning_rate=3e-3,
         camera_width=camera_width,
         camera_height=camera_height,
         model_width=model_width,
         model_height=model_height,
         fov_x_degrees=fov_x_degrees,
-        jitter_degrees=jitter_degrees,
         noise_prob=noise_prob,
-        cache_samples=True,
+        reg_lambda=reg_lambda,
         dataset_seed=dataset_seed,
         catalog_seed=catalog_seed,
     )
 
+    if torch.cuda.is_available():
+        calib_device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        calib_device = torch.device("mps")
+    else:
+        calib_device = torch.device("cpu")
+    temperature = calibrate_temperature(model, val_loader, calib_device)
+
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_seed{catalog_seed}"
     models_dir = Path(__file__).resolve().parent / "../models"
 
-    # run_id links all generated files (pth/header/catalog/manifest) from one run.
     save_run_artifacts(
         model=model,
         star_catalog=star_catalog,
@@ -704,6 +1010,8 @@ if __name__ == "__main__":
         catalog_seed=catalog_seed,
         dataset_seed=dataset_seed,
         fov_x_degrees=fov_x_degrees,
-        jitter_degrees=jitter_degrees,
+        jitter_degrees=15.0,
         noise_prob=noise_prob,
+        temperature=temperature,
+        reg_lambda=reg_lambda,
     )

@@ -1,16 +1,11 @@
 #include "star_tracker.h"
 
 #if STAR_TRACKER_USE_FLOAT
-// Header stores quantized ints, so float mode dequantizes back to approximate real weights.
 static inline float dequantize_weight(weight_storage_t x) {
     return static_cast<float>(x) / static_cast<float>(1 << ST_FRAC_BITS);
 }
-
-static inline float get_input_value(pixel_t x) {
-    return x;
-}
+static inline float get_input_value(pixel_t x) { return x; }
 #else
-// Fixed-point path: convert integer pixels into Q(frac_bits) representation.
 static inline accum_t to_fixed_input(pixel_t x) {
     return static_cast<accum_t>(x) << ST_FRAC_BITS;
 }
@@ -19,32 +14,30 @@ static inline accum_t to_fixed_input(pixel_t x) {
 static inline int conv1_w_idx(int oc, int ic, int ky, int kx) {
     return (((oc * ST_CONV1_IN_CH + ic) * ST_CONV1_K + ky) * ST_CONV1_K + kx);
 }
-
 static inline int conv2_w_idx(int oc, int ic, int ky, int kx) {
     return (((oc * ST_CONV2_IN_CH + ic) * ST_CONV2_K + ky) * ST_CONV2_K + kx);
 }
-
-static inline int input_idx(int y, int x) {
-    return y * ST_INPUT_WIDTH + x;
+static inline int conv3_w_idx(int oc, int ic, int ky, int kx) {
+    return (((oc * ST_CONV3_IN_CH + ic) * ST_CONV3_K + ky) * ST_CONV3_K + kx);
 }
+static inline int input_idx(int y, int x) { return y * ST_INPUT_WIDTH + x; }
 
 void star_tracker_cnn(
     const pixel_t input_image[ST_INPUT_PIXELS],
     int *predicted_class
 ) {
-    // HLS interfaces:
-    // - Input image comes from BRAM.
-    // - predicted_class and return are AXI-Lite control registers.
     #pragma HLS INTERFACE bram port=input_image
     #pragma HLS INTERFACE s_axilite port=predicted_class bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=return bundle=CTRL
 
     accum_t conv1_out[ST_CONV1_OUT_CH][ST_CONV1_OUT_H][ST_CONV1_OUT_W];
     accum_t conv2_out[ST_CONV2_OUT_CH][ST_CONV2_OUT_H][ST_CONV2_OUT_W];
-    accum_t gap[ST_CONV2_OUT_CH];
+    accum_t conv3_out[ST_CONV3_OUT_CH][ST_CONV3_OUT_H][ST_CONV3_OUT_W];
+    accum_t pool_out[ST_CONV3_OUT_CH][ST_POOL_H][ST_POOL_W];
+    accum_t fc1_out[ST_FC1_OUT];
     accum_t logits[ST_NUM_CLASSES];
 
-    // Stage 1: Conv1 + ReLU
+    // ---- Stage 1: Conv1 + ReLU (BN folded into weights) ----
     for (int oc = 0; oc < ST_CONV1_OUT_CH; ++oc) {
         for (int oy = 0; oy < ST_CONV1_OUT_H; ++oy) {
             for (int ox = 0; ox < ST_CONV1_OUT_W; ++ox) {
@@ -59,13 +52,11 @@ void star_tracker_cnn(
                         int in_x = ox * ST_CONV1_STRIDE + kx - ST_CONV1_PAD;
                         if (in_y >= 0 && in_y < ST_INPUT_HEIGHT && in_x >= 0 && in_x < ST_INPUT_WIDTH) {
 #if STAR_TRACKER_USE_FLOAT
-                            accum_t w = dequantize_weight(conv1_w[conv1_w_idx(oc, 0, ky, kx)]);
-                            accum_t v = get_input_value(input_image[input_idx(in_y, in_x)]);
-                            sum += w * v;
+                            sum += dequantize_weight(conv1_w[conv1_w_idx(oc, 0, ky, kx)])
+                                   * get_input_value(input_image[input_idx(in_y, in_x)]);
 #else
                             accum_t w = conv1_w[conv1_w_idx(oc, 0, ky, kx)];
-                            accum_t v = to_fixed_input(input_image[input_idx(in_y, in_x)]);
-                            sum += (w * v) >> ST_FRAC_BITS;
+                            sum += (w * to_fixed_input(input_image[input_idx(in_y, in_x)])) >> ST_FRAC_BITS;
 #endif
                         }
                     }
@@ -75,7 +66,7 @@ void star_tracker_cnn(
         }
     }
 
-    // Stage 2: Conv2 + ReLU
+    // ---- Stage 2: Conv2 + ReLU ----
     for (int oc = 0; oc < ST_CONV2_OUT_CH; ++oc) {
         for (int oy = 0; oy < ST_CONV2_OUT_H; ++oy) {
             for (int ox = 0; ox < ST_CONV2_OUT_W; ++ox) {
@@ -91,11 +82,10 @@ void star_tracker_cnn(
                             int in_x = ox * ST_CONV2_STRIDE + kx - ST_CONV2_PAD;
                             if (in_y >= 0 && in_y < ST_CONV1_OUT_H && in_x >= 0 && in_x < ST_CONV1_OUT_W) {
 #if STAR_TRACKER_USE_FLOAT
-                                accum_t w = dequantize_weight(conv2_w[conv2_w_idx(oc, ic, ky, kx)]);
-                                sum += w * conv1_out[ic][in_y][in_x];
+                                sum += dequantize_weight(conv2_w[conv2_w_idx(oc, ic, ky, kx)])
+                                       * conv1_out[ic][in_y][in_x];
 #else
-                                accum_t w = conv2_w[conv2_w_idx(oc, ic, ky, kx)];
-                                sum += (w * conv1_out[ic][in_y][in_x]) >> ST_FRAC_BITS;
+                                sum += (conv2_w[conv2_w_idx(oc, ic, ky, kx)] * conv1_out[ic][in_y][in_x]) >> ST_FRAC_BITS;
 #endif
                             }
                         }
@@ -106,44 +96,99 @@ void star_tracker_cnn(
         }
     }
 
-    // Stage 3: Global Average Pooling (GAP)
-    // This collapses each channel to one value and greatly reduces FC parameters.
-    const int gap_count = ST_CONV2_OUT_H * ST_CONV2_OUT_W;
-    for (int c = 0; c < ST_CONV2_OUT_CH; ++c) {
+    // ---- Stage 3: Conv3 + ReLU ----
+    for (int oc = 0; oc < ST_CONV3_OUT_CH; ++oc) {
+        for (int oy = 0; oy < ST_CONV3_OUT_H; ++oy) {
+            for (int ox = 0; ox < ST_CONV3_OUT_W; ++ox) {
 #if STAR_TRACKER_USE_FLOAT
-        accum_t sum = 0.0f;
+                accum_t sum = dequantize_weight(conv3_b[oc]);
 #else
-        accum_t sum = 0;
+                accum_t sum = conv3_b[oc];
 #endif
-        for (int y = 0; y < ST_CONV2_OUT_H; ++y) {
-            for (int x = 0; x < ST_CONV2_OUT_W; ++x) {
-                sum += conv2_out[c][y][x];
+                for (int ic = 0; ic < ST_CONV3_IN_CH; ++ic) {
+                    for (int ky = 0; ky < ST_CONV3_K; ++ky) {
+                        for (int kx = 0; kx < ST_CONV3_K; ++kx) {
+                            int in_y = oy * ST_CONV3_STRIDE + ky - ST_CONV3_PAD;
+                            int in_x = ox * ST_CONV3_STRIDE + kx - ST_CONV3_PAD;
+                            if (in_y >= 0 && in_y < ST_CONV2_OUT_H && in_x >= 0 && in_x < ST_CONV2_OUT_W) {
+#if STAR_TRACKER_USE_FLOAT
+                                sum += dequantize_weight(conv3_w[conv3_w_idx(oc, ic, ky, kx)])
+                                       * conv2_out[ic][in_y][in_x];
+#else
+                                sum += (conv3_w[conv3_w_idx(oc, ic, ky, kx)] * conv2_out[ic][in_y][in_x]) >> ST_FRAC_BITS;
+#endif
+                            }
+                        }
+                    }
+                }
+                conv3_out[oc][oy][ox] = (sum > 0) ? sum : (accum_t)0;
             }
         }
-        gap[c] = sum / gap_count;
     }
 
-    // Stage 4: Final fully-connected classifier.
+    // ---- Stage 4: Spatial Average Pool (3×5) ----
+    // Each bin covers ST_POOL_BIN_H × ST_POOL_BIN_W pixels (integer sizes).
+    for (int c = 0; c < ST_CONV3_OUT_CH; ++c) {
+        for (int ph = 0; ph < ST_POOL_H; ++ph) {
+            for (int pw = 0; pw < ST_POOL_W; ++pw) {
+#if STAR_TRACKER_USE_FLOAT
+                accum_t sum = 0.0f;
+#else
+                accum_t sum = 0;
+#endif
+                for (int dy = 0; dy < ST_POOL_BIN_H; ++dy) {
+                    for (int dx = 0; dx < ST_POOL_BIN_W; ++dx) {
+                        int fy = ph * ST_POOL_BIN_H + dy;
+                        int fx = pw * ST_POOL_BIN_W + dx;
+                        sum += conv3_out[c][fy][fx];
+                    }
+                }
+                pool_out[c][ph][pw] = sum / (ST_POOL_BIN_H * ST_POOL_BIN_W);
+            }
+        }
+    }
+
+    // ---- Stage 5: FC1 + ReLU ----
+    for (int j = 0; j < ST_FC1_OUT; ++j) {
+#if STAR_TRACKER_USE_FLOAT
+        accum_t sum = dequantize_weight(fc1_b[j]);
+#else
+        accum_t sum = fc1_b[j];
+#endif
+        int idx = 0;
+        for (int c = 0; c < ST_CONV3_OUT_CH; ++c) {
+            for (int ph = 0; ph < ST_POOL_H; ++ph) {
+                for (int pw = 0; pw < ST_POOL_W; ++pw) {
+#if STAR_TRACKER_USE_FLOAT
+                    sum += dequantize_weight(fc1_w[j * ST_FC1_IN + idx]) * pool_out[c][ph][pw];
+#else
+                    sum += (fc1_w[j * ST_FC1_IN + idx] * pool_out[c][ph][pw]) >> ST_FRAC_BITS;
+#endif
+                    ++idx;
+                }
+            }
+        }
+        fc1_out[j] = (sum > 0) ? sum : (accum_t)0;
+    }
+
+    // ---- Stage 6: FC2 (classifier) ----
     for (int cls = 0; cls < ST_NUM_CLASSES; ++cls) {
 #if STAR_TRACKER_USE_FLOAT
-        accum_t sum = dequantize_weight(fc_b[cls]);
+        accum_t sum = dequantize_weight(fc2_b[cls]);
 #else
-        accum_t sum = fc_b[cls];
+        accum_t sum = fc2_b[cls];
 #endif
-        for (int c = 0; c < ST_CONV2_OUT_CH; ++c) {
-            int idx = cls * ST_CONV2_OUT_CH + c;
+        for (int j = 0; j < ST_FC1_OUT; ++j) {
 #if STAR_TRACKER_USE_FLOAT
-            accum_t w = dequantize_weight(fc_w[idx]);
-            sum += w * gap[c];
+            sum += dequantize_weight(fc2_w[cls * ST_FC1_OUT + j]) * fc1_out[j];
 #else
-            accum_t w = fc_w[idx];
-            sum += (w * gap[c]) >> ST_FRAC_BITS;
+            sum += (fc2_w[cls * ST_FC1_OUT + j] * fc1_out[j]) >> ST_FRAC_BITS;
 #endif
         }
         logits[cls] = sum;
     }
 
-    // Stage 5: Argmax for predicted attitude class.
+    // ---- Stage 7: Argmax ----
     int best_class = 0;
     accum_t best_logit = logits[0];
     for (int cls = 1; cls < ST_NUM_CLASSES; ++cls) {
