@@ -1,0 +1,45 @@
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Baseline CPU outputs
+Baseline_CPU_version/starfield_dataset/
+Baseline_CPU_version/*.pkl
+Baseline_CPU_version/*.png
+Baseline_CPU_version/benchmark_report.txt
+Baseline_CPU_version/training_curves.png
+Baseline_CPU_version/confusion_matrix.png
+
+# FPGA / ML generated artifacts
+FPGA_version/ml/models/*.json
+FPGA_version/ml/models/*.npy
+FPGA_version/ml/models/*.pth
+FPGA_version/ml/models/*_seed*.h
+!FPGA_version/ml/models/star_tracker_weights.h
+FPGA_version/ml/scripts/star_tracker_tb_float
+
+# HLS / build outputs
+csim_results/
+synth_results/
+impl_results/
+hls_results/
+*.o
+*.a
+*.so
+*.d
