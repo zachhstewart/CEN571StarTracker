@@ -255,29 +255,29 @@ def render_interactive(manifest, star_catalog, model, device, camera_width=640, 
     fov_x_default = float(manifest.get("fov_x_degrees", 62.0))
     psf_sigma = 1.5
     
-    # Create figure with dedicated space for the image, info panel, and sliders.
+    # Give most vertical space to the star image; keep controls in a compact bottom band.
     fig = plt.figure(figsize=(14, 10))
-    fig.subplots_adjust(left=0.05, right=0.98, top=0.92, bottom=0.42)
+    fig.subplots_adjust(left=0.04, right=0.99, top=0.95, bottom=0.22)
     
-    # Main image display (top)
-    ax_img = plt.subplot(2, 1, 1)
+    # Main image display occupies most of the figure.
+    ax_img = fig.add_axes([0.04, 0.28, 0.92, 0.64])
     ax_img.set_title("Star Field View (rotate with sliders below)", fontsize=12, fontweight="bold")
     ax_img.set_xlim(0, camera_width)
     ax_img.set_ylim(camera_height, 0)
     im = ax_img.imshow(np.zeros((camera_height, camera_width)), cmap="gray", vmin=0.0, vmax=1.0)
     ax_img.axis("off")
     
-    # Prediction text area sits above the sliders so it does not overlap them.
-    ax_text = fig.add_axes([0.72, 0.47, 0.24, 0.25])
+    # Compact prediction text area at lower-right, away from the main image.
+    ax_text = fig.add_axes([0.73, 0.06, 0.25, 0.15])
     ax_text.axis("off")
     text_display = ax_text.text(0.1, 0.9, "", transform=ax_text.transAxes, fontsize=11, verticalalignment="top",
                                  family="monospace", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8))
     
-    # Slider axes
-    ax_yaw = plt.axes([0.15, 0.30, 0.55, 0.03])
-    ax_pitch = plt.axes([0.15, 0.24, 0.55, 0.03])
-    ax_roll = plt.axes([0.15, 0.18, 0.55, 0.03])
-    ax_fov = plt.axes([0.15, 0.12, 0.55, 0.03])
+    # Slider axes in a tight bottom-left strip.
+    ax_yaw = plt.axes([0.08, 0.17, 0.60, 0.025])
+    ax_pitch = plt.axes([0.08, 0.13, 0.60, 0.025])
+    ax_roll = plt.axes([0.08, 0.09, 0.60, 0.025])
+    ax_fov = plt.axes([0.08, 0.05, 0.60, 0.025])
     
     slider_yaw = widgets.Slider(ax_yaw, "Yaw (°)", -180, 180, valinit=0, color="blue")
     slider_pitch = widgets.Slider(ax_pitch, "Pitch (°)", -90, 90, valinit=0, color="green")
