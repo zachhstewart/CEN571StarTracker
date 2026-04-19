@@ -17,6 +17,7 @@ from datetime import datetime
 from math import atan, tan
 from pathlib import Path
 import json
+import os
 import random
 
 import numpy as np
@@ -53,12 +54,20 @@ CLASS_NAMES = {
 }
 
 
-# Tiny CNN chosen to keep HLS header and compute footprint manageable.
-CNN_CONV1_OUT_CH = 8
-CNN_CONV2_OUT_CH = 16
-CNN_KERNEL = 3
+# CNN architecture — balanced for both accuracy and FPGA feasibility.
+CNN_CONV1_OUT_CH = 16
+CNN_CONV1_KERNEL = 5    # larger receptive field for conv1
+CNN_CONV1_PAD = 2       # keeps 160→80 with stride 2
+CNN_CONV2_OUT_CH = 32
+CNN_CONV3_OUT_CH = 64
+CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
+# After conv1(s=2): 80×60; conv2(s=2): 40×30; conv3(s=2): 20×15
+# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 64×3×5=960 features
+CNN_POOL_H = 3
+CNN_POOL_W = 5
+CNN_FC1_OUT = 128
 
 
 def make_star_catalog(num_stars=NUM_STARS, seed=UNIVERSE_SEED):
@@ -144,26 +153,30 @@ def render_star_camera(
     rotated_xyz = rotated_xyz[in_front_mask]
     magnitudes = star_catalog[in_front_mask, 3]
 
-    # Project each star and apply PSF blurring
-    for (x, y, z), magnitude in zip(rotated_xyz, magnitudes):
-        u_float = (fx * x / z) + cx
-        v_float = (fy * y / z) + cy
-        
-        # Apply Gaussian PSF by spreading magnitude over nearby pixels
-        u_center = int(np.round(u_float))
-        v_center = int(np.round(v_float))
-        
-        psf_kernel_size = int(np.ceil(3 * psf_sigma))
-        for du in range(-psf_kernel_size, psf_kernel_size + 1):
-            for dv in range(-psf_kernel_size, psf_kernel_size + 1):
-                u = u_center + du
-                v = v_center + dv
-                
-                if 0 <= u < img_width and 0 <= v < img_height:
-                    # Gaussian PSF: weight decreases with distance from center
-                    dist_sq = (u_float - u)**2 + (v_float - v)**2
-                    psf_weight = np.exp(-dist_sq / (2 * psf_sigma**2))
-                    img[v, u] += magnitude * psf_weight
+    # Vectorized PSF: compute all star projections at once
+    u_float = (fx * rotated_xyz[:, 0] / rotated_xyz[:, 2]) + cx  # (N,)
+    v_float = (fy * rotated_xyz[:, 1] / rotated_xyz[:, 2]) + cy  # (N,)
+
+    psf_kernel_size = int(np.ceil(3 * psf_sigma))
+    offsets = np.arange(-psf_kernel_size, psf_kernel_size + 1)
+    du, dv = np.meshgrid(offsets, offsets)
+    du = du.flatten()  # (K²,)
+    dv = dv.flatten()  # (K²,)
+
+    u_center = np.round(u_float).astype(np.int32)  # (N,)
+    v_center = np.round(v_float).astype(np.int32)  # (N,)
+
+    # (N, K²) pixel coordinates
+    u_pix = u_center[:, None] + du[None, :]
+    v_pix = v_center[:, None] + dv[None, :]
+
+    dist_sq = (u_float[:, None] - u_pix) ** 2 + (v_float[:, None] - v_pix) ** 2
+    psf_weight = np.exp(-dist_sq / (2 * psf_sigma ** 2))  # (N, K²)
+
+    contributions = magnitudes[:, None] * psf_weight  # (N, K²)
+
+    valid = (u_pix >= 0) & (u_pix < img_width) & (v_pix >= 0) & (v_pix < img_height)
+    np.add.at(img, (v_pix[valid], u_pix[valid]), contributions[valid])
 
     return np.clip(img, 0.0, 1.0)
 
@@ -208,6 +221,12 @@ def generate_labeled_sample(
         fov_x_degrees=fov_x_degrees,
         psf_sigma=psf_sigma,
     )
+
+    # Max-normalize: sparse star images have very low raw pixel values.
+    # Without this, most of the [0,1] range is unused and gradients starve.
+    max_val = img_np.max()
+    if max_val > 1e-6:
+        img_np = img_np / max_val
 
     img = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0)
 
@@ -325,25 +344,39 @@ class StarTrackerSyntheticDataset(Dataset):
 
 class StarTrackerTinyCNN(nn.Module):
     """
-    Minimal CNN designed to balance accuracy with hardware friendliness.
+    Three-conv CNN with spatial pooling for star-attitude classification.
 
-    Architecture: Conv -> ReLU -> Conv -> ReLU -> Global Average Pool -> Linear.
-    This avoids a very large fully-connected layer on raw 640x480 pixels.
+    Key design decisions:
+    - AdaptiveAvgPool2d((3,5)) preserves spatial layout of stars, which encodes orientation.
+      The previous (1,1) global pool discarded all positional information.
+    - BatchNorm after each conv for stable gradient flow on sparse star images.
+    - Hidden FC (960→128→6) adds capacity without exploding FPGA weight storage.
+    - BN is folded into conv weights at export time, so the HLS kernel stays simple.
     """
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, CNN_CONV1_OUT_CH, kernel_size=CNN_KERNEL, stride=CNN_STRIDE, padding=CNN_PAD)
+        self.conv1 = nn.Conv2d(1, CNN_CONV1_OUT_CH, kernel_size=CNN_CONV1_KERNEL, stride=CNN_STRIDE, padding=CNN_CONV1_PAD)
+        self.bn1 = nn.BatchNorm2d(CNN_CONV1_OUT_CH)
         self.conv2 = nn.Conv2d(CNN_CONV1_OUT_CH, CNN_CONV2_OUT_CH, kernel_size=CNN_KERNEL, stride=CNN_STRIDE, padding=CNN_PAD)
-        self.relu = nn.ReLU()
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(CNN_CONV2_OUT_CH, num_classes)
+        self.bn2 = nn.BatchNorm2d(CNN_CONV2_OUT_CH)
+        self.conv3 = nn.Conv2d(CNN_CONV2_OUT_CH, CNN_CONV3_OUT_CH, kernel_size=CNN_KERNEL, stride=CNN_STRIDE, padding=CNN_PAD)
+        self.bn3 = nn.BatchNorm2d(CNN_CONV3_OUT_CH)
+        self.pool = nn.AdaptiveAvgPool2d((CNN_POOL_H, CNN_POOL_W))
+        self.drop1 = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(CNN_CONV3_OUT_CH * CNN_POOL_H * CNN_POOL_W, CNN_FC1_OUT)
+        self.drop2 = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(CNN_FC1_OUT, num_classes)
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
         x = torch.flatten(x, 1)
-        x = self.fc(x)
+        x = self.drop1(x)
+        x = F.relu(self.fc1(x))
+        x = self.drop2(x)
+        x = self.fc2(x)
         return x
 
 
@@ -390,31 +423,66 @@ def write_flat_array(f, name, array, elements_per_line=24):
     f.write("\n};\n\n")
 
 
+def fold_bn_into_conv(conv_w, conv_b, bn_mean, bn_var, bn_gamma, bn_beta, bn_eps=1e-5):
+    """Fold BatchNorm parameters into the preceding conv layer for hardware export.
+
+    After folding, the HLS kernel only needs conv+bias — no separate BN stage.
+    Math: BN(W*x+b) = scale*(W*x + b - mean) + beta
+          = (scale*W)*x + (scale*(b-mean) + beta)   where scale = gamma/sqrt(var+eps)
+    """
+    scale = bn_gamma / np.sqrt(bn_var + bn_eps)       # (out_ch,)
+    folded_w = conv_w * scale[:, None, None, None]
+    folded_b = (conv_b - bn_mean) * scale + bn_beta
+    return folded_w, folded_b
+
+
 def export_to_hls_header(model, output_header_path, frac_bits, model_width, model_height, catalog_seed):
     """
     Export trained CNN parameters to a C header consumed by HLS C++ inference.
 
-    Export format intentionally includes network shape macros and seed metadata so the
-    generated header can be traced back to the starscape that created the model.
+    BatchNorm layers are folded into conv weights at export time so the hardware
+    kernel implements only conv+bias. The generated header encodes all shape macros
+    and the catalog seed so it can be traced back to the run that produced it.
     """
-    model_cpu = model.cpu()
+    model_cpu = model.cpu().eval()
 
-    conv1_w = model_cpu.conv1.weight.detach().numpy()
-    conv1_b = model_cpu.conv1.bias.detach().numpy()
-    conv2_w = model_cpu.conv2.weight.detach().numpy()
-    conv2_b = model_cpu.conv2.bias.detach().numpy()
-    fc_w = model_cpu.fc.weight.detach().numpy()
-    fc_b = model_cpu.fc.bias.detach().numpy()
+    def get_np(param):
+        return param.detach().numpy()
 
-    conv1_w_q = quantize_array(conv1_w, frac_bits)
-    conv1_b_q = quantize_array(conv1_b, frac_bits)
-    conv2_w_q = quantize_array(conv2_w, frac_bits)
-    conv2_b_q = quantize_array(conv2_b, frac_bits)
-    fc_w_q = quantize_array(fc_w, frac_bits)
-    fc_b_q = quantize_array(fc_b, frac_bits)
+    # Fold BN into conv weights
+    c1w, c1b = fold_bn_into_conv(
+        get_np(model_cpu.conv1.weight), get_np(model_cpu.conv1.bias),
+        get_np(model_cpu.bn1.running_mean), get_np(model_cpu.bn1.running_var),
+        get_np(model_cpu.bn1.weight), get_np(model_cpu.bn1.bias),
+    )
+    c2w, c2b = fold_bn_into_conv(
+        get_np(model_cpu.conv2.weight), get_np(model_cpu.conv2.bias),
+        get_np(model_cpu.bn2.running_mean), get_np(model_cpu.bn2.running_var),
+        get_np(model_cpu.bn2.weight), get_np(model_cpu.bn2.bias),
+    )
+    c3w, c3b = fold_bn_into_conv(
+        get_np(model_cpu.conv3.weight), get_np(model_cpu.conv3.bias),
+        get_np(model_cpu.bn3.running_mean), get_np(model_cpu.bn3.running_var),
+        get_np(model_cpu.bn3.weight), get_np(model_cpu.bn3.bias),
+    )
+    fc1_w = get_np(model_cpu.fc1.weight)
+    fc1_b = get_np(model_cpu.fc1.bias)
+    fc2_w = get_np(model_cpu.fc2.weight)
+    fc2_b = get_np(model_cpu.fc2.bias)
+
+    c1w_q  = quantize_array(c1w,  frac_bits)
+    c1b_q  = quantize_array(c1b,  frac_bits)
+    c2w_q  = quantize_array(c2w,  frac_bits)
+    c2b_q  = quantize_array(c2b,  frac_bits)
+    c3w_q  = quantize_array(c3w,  frac_bits)
+    c3b_q  = quantize_array(c3b,  frac_bits)
+    fc1w_q = quantize_array(fc1_w, frac_bits)
+    fc1b_q = quantize_array(fc1_b, frac_bits)
+    fc2w_q = quantize_array(fc2_w, frac_bits)
+    fc2b_q = quantize_array(fc2_b, frac_bits)
 
     with open(output_header_path, "w", encoding="utf-8") as f:
-        f.write("// Auto-generated header file for Star Tracker Tiny CNN weights\n")
+        f.write("// Auto-generated header: Star Tracker CNN weights (BN folded into conv)\n")
         f.write(f"// Scale factor: {1 << frac_bits} (fixed-point)\n")
         f.write(f"// Star catalog seed: {catalog_seed}\n\n")
 
@@ -427,39 +495,55 @@ def export_to_hls_header(model, output_header_path, frac_bits, model_width, mode
         f.write("typedef int weight_storage_t;\n")
         f.write("#endif\n\n")
 
-        f.write("#define ST_INPUT_WIDTH {}\n".format(model_width))
-        f.write("#define ST_INPUT_HEIGHT {}\n".format(model_height))
-        f.write("#define ST_NUM_CLASSES {}\n".format(NUM_CLASSES))
-        f.write("#define ST_FRAC_BITS {}\n".format(frac_bits))
-        f.write("#define ST_CATALOG_SEED {}\n\n".format(catalog_seed))
+        f.write(f"#define ST_INPUT_WIDTH {model_width}\n")
+        f.write(f"#define ST_INPUT_HEIGHT {model_height}\n")
+        f.write(f"#define ST_NUM_CLASSES {NUM_CLASSES}\n")
+        f.write(f"#define ST_FRAC_BITS {frac_bits}\n")
+        f.write(f"#define ST_CATALOG_SEED {catalog_seed}\n\n")
 
-        f.write("#define ST_CONV1_IN_CH 1\n")
-        f.write("#define ST_CONV1_OUT_CH {}\n".format(CNN_CONV1_OUT_CH))
-        f.write("#define ST_CONV1_K {}\n".format(CNN_KERNEL))
-        f.write("#define ST_CONV1_STRIDE {}\n".format(CNN_STRIDE))
-        f.write("#define ST_CONV1_PAD {}\n\n".format(CNN_PAD))
+        f.write(f"#define ST_CONV1_IN_CH 1\n")
+        f.write(f"#define ST_CONV1_OUT_CH {CNN_CONV1_OUT_CH}\n")
+        f.write(f"#define ST_CONV1_K {CNN_CONV1_KERNEL}\n")
+        f.write(f"#define ST_CONV1_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV1_PAD {CNN_CONV1_PAD}\n\n")
 
-        f.write("#define ST_CONV2_IN_CH {}\n".format(CNN_CONV1_OUT_CH))
-        f.write("#define ST_CONV2_OUT_CH {}\n".format(CNN_CONV2_OUT_CH))
-        f.write("#define ST_CONV2_K {}\n".format(CNN_KERNEL))
-        f.write("#define ST_CONV2_STRIDE {}\n".format(CNN_STRIDE))
-        f.write("#define ST_CONV2_PAD {}\n\n".format(CNN_PAD))
+        f.write(f"#define ST_CONV2_IN_CH {CNN_CONV1_OUT_CH}\n")
+        f.write(f"#define ST_CONV2_OUT_CH {CNN_CONV2_OUT_CH}\n")
+        f.write(f"#define ST_CONV2_K {CNN_KERNEL}\n")
+        f.write(f"#define ST_CONV2_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV2_PAD {CNN_PAD}\n\n")
 
-        write_flat_array(f, "conv1_w", conv1_w_q)
-        write_flat_array(f, "conv1_b", conv1_b_q)
-        write_flat_array(f, "conv2_w", conv2_w_q)
-        write_flat_array(f, "conv2_b", conv2_b_q)
-        write_flat_array(f, "fc_w", fc_w_q)
-        write_flat_array(f, "fc_b", fc_b_q)
+        f.write(f"#define ST_CONV3_IN_CH {CNN_CONV2_OUT_CH}\n")
+        f.write(f"#define ST_CONV3_OUT_CH {CNN_CONV3_OUT_CH}\n")
+        f.write(f"#define ST_CONV3_K {CNN_KERNEL}\n")
+        f.write(f"#define ST_CONV3_STRIDE {CNN_STRIDE}\n")
+        f.write(f"#define ST_CONV3_PAD {CNN_PAD}\n\n")
+
+        f.write(f"#define ST_POOL_H {CNN_POOL_H}\n")
+        f.write(f"#define ST_POOL_W {CNN_POOL_W}\n\n")
+
+        f.write(f"#define ST_FC1_IN  ({CNN_CONV3_OUT_CH} * {CNN_POOL_H} * {CNN_POOL_W})\n")
+        f.write(f"#define ST_FC1_OUT {CNN_FC1_OUT}\n\n")
+
+        write_flat_array(f, "conv1_w", c1w_q)
+        write_flat_array(f, "conv1_b", c1b_q)
+        write_flat_array(f, "conv2_w", c2w_q)
+        write_flat_array(f, "conv2_b", c2b_q)
+        write_flat_array(f, "conv3_w", c3w_q)
+        write_flat_array(f, "conv3_b", c3b_q)
+        write_flat_array(f, "fc1_w",   fc1w_q)
+        write_flat_array(f, "fc1_b",   fc1b_q)
+        write_flat_array(f, "fc2_w",   fc2w_q)
+        write_flat_array(f, "fc2_b",   fc2b_q)
 
         f.write("#endif // STAR_TRACKER_WEIGHTS_H\n")
 
 
 def train_model(
-    num_samples=4000,
-    num_epochs=60,
-    batch_size=64,
-    learning_rate=5e-3,
+    num_samples=12000,
+    num_epochs=100,
+    batch_size=128,
+    learning_rate=3e-3,
     camera_width=640,
     camera_height=480,
     model_width=160,
@@ -473,16 +557,14 @@ def train_model(
     catalog_seed=UNIVERSE_SEED,
 ):
     """
-    Train the tiny CNN on synthetic star-camera images with improved realism.
+    Train the star-attitude CNN on synthetic star-camera images.
 
-    Improvements:
-    - Uses magnitude-based star brightness for texture information
-    - Applies PSF blurring to simulate camera optics
-    - Larger batch size (64) for more stable gradient estimates and fewer steps per epoch
-    - Higher learning rate (5e-3) with decay schedule
-    - More training epochs (60) to allow convergence
-    - Gaussian noise on continuous intensity values
-    - Optional dataset caching to avoid re-rendering samples every epoch
+    Key improvements over the original:
+    - 3× more samples (12 000) for better class coverage
+    - Cosine annealing LR: smooth decay avoids the cliff of StepLR
+    - Larger batch (128) for more stable gradient estimates
+    - Per-image contrast normalization ensures full [0,1] dynamic range
+    - New architecture preserves spatial position of stars via AdaptiveAvgPool (3×5)
     """
     star_catalog = make_star_catalog(num_stars=NUM_STARS, seed=catalog_seed)
 
@@ -515,15 +597,22 @@ def train_model(
         generator=torch.Generator().manual_seed(7),
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    num_workers = min(4, os.cpu_count() or 1)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, persistent_workers=num_workers > 0)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, persistent_workers=num_workers > 0)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
     model = StarTrackerTinyCNN(num_classes=NUM_CLASSES).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
     for epoch in range(num_epochs):
         model.train()
@@ -671,10 +760,10 @@ if __name__ == "__main__":
     noise_prob = 0.01
 
     model, star_catalog = train_model(
-        num_samples=4000,
-        num_epochs=60,
-        batch_size=64,
-        learning_rate=5e-3,
+        num_samples=12000,
+        num_epochs=100,
+        batch_size=128,
+        learning_rate=3e-3,
         camera_width=camera_width,
         camera_height=camera_height,
         model_width=model_width,

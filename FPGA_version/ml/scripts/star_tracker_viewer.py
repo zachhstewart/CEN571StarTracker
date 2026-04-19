@@ -197,28 +197,44 @@ def render_view(manifest, star_catalog, output_path=None, psf_sigma=1.5):
 
 
 class StarTrackerTinyCNN(nn.Module):
-    """Minimal CNN for attitude estimation (matches training architecture)."""
+    """CNN for attitude estimation — must match the architecture in train.py."""
     NUM_CLASSES = 6
-    CONV1_OUT_CH = 8
-    CONV2_OUT_CH = 16
+    CONV1_OUT_CH = 16
+    CONV2_OUT_CH = 32
+    CONV3_OUT_CH = 64
+    CONV1_K = 5
     KERNEL = 3
     STRIDE = 2
+    CONV1_PAD = 2
     PAD = 1
+    POOL_H = 3
+    POOL_W = 5
+    FC1_OUT = 128
 
     def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, self.CONV1_OUT_CH, kernel_size=self.KERNEL, stride=self.STRIDE, padding=self.PAD)
+        self.conv1 = nn.Conv2d(1, self.CONV1_OUT_CH, kernel_size=self.CONV1_K, stride=self.STRIDE, padding=self.CONV1_PAD)
+        self.bn1 = nn.BatchNorm2d(self.CONV1_OUT_CH)
         self.conv2 = nn.Conv2d(self.CONV1_OUT_CH, self.CONV2_OUT_CH, kernel_size=self.KERNEL, stride=self.STRIDE, padding=self.PAD)
-        self.relu = nn.ReLU()
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(self.CONV2_OUT_CH, num_classes)
+        self.bn2 = nn.BatchNorm2d(self.CONV2_OUT_CH)
+        self.conv3 = nn.Conv2d(self.CONV2_OUT_CH, self.CONV3_OUT_CH, kernel_size=self.KERNEL, stride=self.STRIDE, padding=self.PAD)
+        self.bn3 = nn.BatchNorm2d(self.CONV3_OUT_CH)
+        self.pool = nn.AdaptiveAvgPool2d((self.POOL_H, self.POOL_W))
+        self.drop1 = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(self.CONV3_OUT_CH * self.POOL_H * self.POOL_W, self.FC1_OUT)
+        self.drop2 = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(self.FC1_OUT, num_classes)
 
     def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
         x = torch.flatten(x, 1)
-        x = self.fc(x)
+        x = self.drop1(x)
+        x = F.relu(self.fc1(x))
+        x = self.drop2(x)
+        x = self.fc2(x)
         return x
 
 
@@ -365,7 +381,12 @@ if __name__ == "__main__":
     manifest, star_catalog = load_run(manifest_path)
 
     if args.interactive:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
         model = load_model(manifest_path, device)
         render_interactive(manifest, star_catalog, model, device)
     else:
