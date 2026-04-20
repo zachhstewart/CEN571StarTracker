@@ -23,12 +23,17 @@ static inline int conv3_w_idx(int oc, int ic, int ky, int kx) {
 static inline int input_idx(int y, int x) { return y * ST_INPUT_WIDTH + x; }
 
 void star_tracker_cnn(
-    const pixel_t input_image[ST_INPUT_PIXELS],
-    int *predicted_class
+    const pixel_t    input_image[ST_INPUT_PIXELS],
+    int             *predicted_class,
+    unsigned char   *direction_gpio
 ) {
-    #pragma HLS INTERFACE bram port=input_image
+    #pragma HLS INTERFACE bram      port=input_image
     #pragma HLS INTERFACE s_axilite port=predicted_class bundle=CTRL
-    #pragma HLS INTERFACE s_axilite port=return bundle=CTRL
+    #pragma HLS INTERFACE s_axilite port=return          bundle=CTRL
+    // ap_none: plain output register, no handshake signals.
+    // Holds the one-hot value after each inference until the next one.
+    // Connect direction_gpio[5:0] to six FPGA output pins in the block design.
+    #pragma HLS INTERFACE ap_none   port=direction_gpio
 
     accum_t conv1_out[ST_CONV1_OUT_CH][ST_CONV1_OUT_H][ST_CONV1_OUT_W];
     accum_t conv2_out[ST_CONV2_OUT_CH][ST_CONV2_OUT_H][ST_CONV2_OUT_W];
@@ -212,7 +217,7 @@ void star_tracker_cnn(
         logits[cls] = sum;
     }
 
-    // ---- Stage 7: Argmax ----
+    // ---- Stage 7: Argmax + GPIO one-hot drive ----
     int best_class = 0;
     accum_t best_logit = logits[0];
     for (int cls = 1; cls < ST_NUM_CLASSES; ++cls) {
@@ -222,5 +227,10 @@ void star_tracker_cnn(
         }
     }
 
+    // Drive exactly one of the six output pins high.
+    // Encoding (matches ST_Direction enum):
+    //   bit 0 = UP       bit 1 = DOWN    bit 2 = LEFT
+    //   bit 3 = RIGHT    bit 4 = FORWARD bit 5 = BACKWARD
+    *direction_gpio  = ST_DIR_MASK(best_class);
     *predicted_class = best_class;
 }

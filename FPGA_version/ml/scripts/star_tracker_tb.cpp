@@ -55,19 +55,40 @@ static void build_diagonal_pattern(pixel_t input_image[ST_INPUT_PIXELS]) {
     }
 }
 
-static bool run_case(const char* name, const pixel_t input_image[ST_INPUT_PIXELS]) {
-    int predicted_class = -1;
-    star_tracker_cnn(input_image, &predicted_class);
-
-    std::cout << name << ": predicted=" << predicted_class;
-
-    if (predicted_class < 0 || predicted_class >= ST_NUM_CLASSES) {
-        std::cout << "  [FAIL]" << std::endl;
-        return false;
+static const char* direction_name(int cls) {
+    switch (cls) {
+        case ST_DIR_UP:       return "UP";
+        case ST_DIR_DOWN:     return "DOWN";
+        case ST_DIR_LEFT:     return "LEFT";
+        case ST_DIR_RIGHT:    return "RIGHT";
+        case ST_DIR_FORWARD:  return "FORWARD";
+        case ST_DIR_BACKWARD: return "BACKWARD";
+        default:              return "UNKNOWN";
     }
+}
 
-    std::cout << "  [PASS]" << std::endl;
-    return true;
+static bool run_case(const char* name, const pixel_t input_image[ST_INPUT_PIXELS]) {
+    int           predicted_class = -1;
+    unsigned char gpio_out        = 0;
+    star_tracker_cnn(input_image, &predicted_class, &gpio_out);
+
+    std::cout << name
+              << ": predicted=" << predicted_class
+              << " (" << direction_name(predicted_class) << ")"
+              << "  gpio=0b";
+    for (int b = 5; b >= 0; --b)
+        std::cout << ((gpio_out >> b) & 1);
+
+    // Verify one-hot: exactly one bit set, and it matches predicted_class.
+    bool one_hot_ok = (gpio_out == ST_DIR_MASK(predicted_class));
+    bool class_ok   = (predicted_class >= 0 && predicted_class < ST_NUM_CLASSES);
+
+    if (class_ok && one_hot_ok) {
+        std::cout << "  [PASS]" << std::endl;
+        return true;
+    }
+    std::cout << "  [FAIL]" << std::endl;
+    return false;
 }
 
 int main() {
