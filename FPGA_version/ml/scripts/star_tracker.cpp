@@ -37,6 +37,30 @@ void star_tracker_cnn(
     accum_t fc1_out[ST_FC1_OUT];
     accum_t logits[ST_NUM_CLASSES];
 
+    // ---- Memory mapping -------------------------------------------------------
+    // Default HLS behaviour maps every local array to distributed RAM (LUT-RAM).
+    // On the XC7Z020 (PYNQ Z2) only 17,400 LUT-RAM sites exist, but the three
+    // conv feature maps alone need ~44,000 — causing a DRC UTLZ-1 over-use error.
+    //
+    // Fix: pin large buffers to Block RAM (140 x 36 Kb tiles on XC7Z020).
+    // Estimated BRAM36 usage after the pragmas below:
+    //   conv1_out  76800 x 21 b  →  ~75 BRAM36
+    //   conv2_out  38400 x 31 b  →  ~38 BRAM36
+    //   conv3_out   1920 x 31 b  →  ~ 2 BRAM36
+    //   pool_out     960 x 28 b  →  ~ 1 BRAM36
+    //   ─────────────────────────────────────────
+    //   Total                       ~116 / 140 BRAM36 (83 %)
+    //
+    // Small buffers (fc1_out, logits) are explicitly kept in LUT-RAM / FFs so
+    // they do NOT accidentally claim a full BRAM tile in future HLS versions.
+    // -------------------------------------------------------------------------
+    #pragma HLS BIND_STORAGE variable=conv1_out type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=conv2_out type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=conv3_out type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=pool_out  type=ram_2p impl=bram
+    #pragma HLS BIND_STORAGE variable=fc1_out   type=ram_1p impl=lutram
+    #pragma HLS BIND_STORAGE variable=logits    type=ram_1p impl=lutram
+
     // ---- Stage 1: Conv1 + ReLU (BN folded into weights) ----
     for (int oc = 0; oc < ST_CONV1_OUT_CH; ++oc) {
         for (int oy = 0; oy < ST_CONV1_OUT_H; ++oy) {
