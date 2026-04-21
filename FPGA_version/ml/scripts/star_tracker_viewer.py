@@ -78,7 +78,7 @@ def quaternion_to_euler_deg(q):
     siny  = 2.0 * (w * z + x * y)
     cosy  = 1.0 - 2.0 * (y * y + z * z)
     yaw   = np.degrees(np.arctan2(siny, cosy))
-    return float(yaw), float(pitch), float(roll)
+    return float(pitch), float(roll), float(yaw)
 
 
 def render_star_camera(star_catalog, yaw, pitch, roll, img_width, img_height, fov_x_degrees, psf_sigma=1.5):
