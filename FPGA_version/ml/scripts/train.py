@@ -728,9 +728,7 @@ def train_model(
     Combined loss: CrossEntropy(class) + reg_lambda * GeodesicLoss(quaternion)
     Returns: (model, star_catalog, val_loader) — val_loader used for temperature calibration.
     """
-    # Classes are 90° apart. At jitter=40° samples reach within 5° of the next
-    # class boundary, creating genuine ambiguity that caps accuracy at 90-95%.
-    CURRICULUM_JITTERS = [10.0, 25.0, 40.0]
+    CURRICULUM_JITTERS = [3.0, 8.0, 15.0]
     phase_len = num_epochs // 3
 
     star_catalog = make_star_catalog(num_stars=NUM_STARS, seed=catalog_seed)
@@ -1013,7 +1011,7 @@ if __name__ == "__main__":
         catalog_seed=catalog_seed,
         dataset_seed=dataset_seed,
         fov_x_degrees=fov_x_degrees,
-        jitter_degrees=40.0,
+        jitter_degrees=15.0,
         noise_prob=noise_prob,
         temperature=temperature,
         reg_lambda=reg_lambda,
