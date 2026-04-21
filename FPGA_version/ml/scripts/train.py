@@ -699,7 +699,7 @@ def export_to_hls_header(model, output_header_path, frac_bits, model_width, mode
 
 
 def train_model(
-    num_samples=12000,
+    num_samples=9000,
     num_epochs=100,
     batch_size=128,
     learning_rate=3e-3,
@@ -719,16 +719,10 @@ def train_model(
 ):
     """
     Train the dual-head CNN with curriculum learning.
-
-    Curriculum phases (split equally across num_epochs):
-      Phase 1 — jitter=3°:  model sees tightly clustered classes, learns coarse features.
-      Phase 2 — jitter=8°:  moderate overlap, refines decision boundaries.
-      Phase 3 — jitter=15°: heavy overlap, forces robust quaternion regression.
-
     Combined loss: CrossEntropy(class) + reg_lambda * GeodesicLoss(quaternion)
     Returns: (model, star_catalog, val_loader) — val_loader used for temperature calibration.
     """
-    CURRICULUM_JITTERS = [3.0, 8.0, 15.0]
+    CURRICULUM_JITTERS = [10.0, 17.0, 25.0]
     phase_len = num_epochs // 3
 
     star_catalog = make_star_catalog(num_stars=NUM_STARS, seed=catalog_seed)
@@ -800,7 +794,7 @@ def train_model(
     print(f"Using device: {device}")
 
     model = StarTrackerTinyCNN(num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
@@ -968,12 +962,12 @@ if __name__ == "__main__":
     catalog_seed  = UNIVERSE_SEED
     dataset_seed  = 42
     fov_x_degrees = 62.0
-    noise_prob    = 0.01
+    noise_prob    = 0.05
     reg_lambda    = 0.5
 
     model, star_catalog, val_loader = train_model(
-        num_samples=12000,
-        num_epochs=100,
+        num_samples=8000,
+        num_epochs=60,
         batch_size=128,
         learning_rate=3e-3,
         camera_width=camera_width,
@@ -1011,7 +1005,7 @@ if __name__ == "__main__":
         catalog_seed=catalog_seed,
         dataset_seed=dataset_seed,
         fov_x_degrees=fov_x_degrees,
-        jitter_degrees=15.0,
+        jitter_degrees=25.0,
         noise_prob=noise_prob,
         temperature=temperature,
         reg_lambda=reg_lambda,
