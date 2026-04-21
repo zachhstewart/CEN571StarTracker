@@ -97,7 +97,7 @@ def quaternion_to_euler_deg(q):
     siny  = 2.0 * (w * z + x * y)
     cosy  = 1.0 - 2.0 * (y * y + z * z)
     yaw   = np.degrees(np.arctan2(siny, cosy))
-    return float(yaw), float(pitch), float(roll)
+    return float(pitch), float(roll), float(yaw)
 
 
 def angular_error_deg_batch(q_pred, q_true):
