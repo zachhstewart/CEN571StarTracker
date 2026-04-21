@@ -32,7 +32,7 @@ FPGA_version/ml/models/*.json
 FPGA_version/ml/models/*.npy
 FPGA_version/ml/models/*.pth
 FPGA_version/ml/models/*_seed*.h
-!FPGA_version/ml/models/star_tracker_weights.h
+FPGA_version/ml/models/star_tracker_weights.h
 FPGA_version/ml/scripts/star_tracker_tb_float
 
 # HLS / build outputs
