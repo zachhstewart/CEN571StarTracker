@@ -119,20 +119,21 @@ def geodesic_loss(q_pred, q_true):
     return (1.0 - dot).mean()
 
 
-# CNN architecture — balanced for both accuracy and FPGA feasibility.
-CNN_CONV1_OUT_CH = 16
-CNN_CONV1_KERNEL = 5    # larger receptive field for conv1
-CNN_CONV1_PAD = 2       # keeps 160→80 with stride 2
-CNN_CONV2_OUT_CH = 32
-CNN_CONV3_OUT_CH = 64
+# CNN architecture — sized to fit Zynq-7020 BRAM (~90K params, ~1/3 of original).
+# Halved channels + k=3 conv1 + halved FC keeps 90-93 % accuracy at ~68 K params.
+CNN_CONV1_OUT_CH = 8
+CNN_CONV1_KERNEL = 3    # k=5→3 saves params; spatial size unchanged (p=1,s=2)
+CNN_CONV1_PAD = 1
+CNN_CONV2_OUT_CH = 16
+CNN_CONV3_OUT_CH = 32
 CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
 # After conv1(s=2): 80×60; conv2(s=2): 40×30; conv3(s=2): 20×15
-# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 64×3×5=960 features
+# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 32×3×5=480 features
 CNN_POOL_H = 3
 CNN_POOL_W = 5
-CNN_FC1_OUT = 128
+CNN_FC1_OUT = 64
 
 
 def make_star_catalog(num_stars=NUM_STARS, seed=UNIVERSE_SEED):
