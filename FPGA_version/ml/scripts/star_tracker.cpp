@@ -148,6 +148,21 @@ void star_tracker_cnn(
         }
     }
 
+    // ---- Calculate Star Density (Mean Brightness) ----
+#if STAR_TRACKER_USE_FLOAT
+    accum_t star_density = 0.0f;
+#else
+    accum_t star_density = 0;
+#endif
+    for (int i = 0; i < ST_INPUT_PIXELS; ++i) {
+#if STAR_TRACKER_USE_FLOAT
+        star_density += get_input_value(input_image[i]);
+#else
+        star_density += to_fixed_input(input_image[i]);
+#endif
+    }
+    star_density /= ST_INPUT_PIXELS;
+
     // ---- Stage 5: FC1 + ReLU ----
     for (int j = 0; j < ST_FC1_OUT; ++j) {
 #if STAR_TRACKER_USE_FLOAT
@@ -168,6 +183,13 @@ void star_tracker_cnn(
                 }
             }
         }
+        
+#if STAR_TRACKER_USE_FLOAT
+        sum += dequantize_weight(fc1_w[j * ST_FC1_IN + idx]) * star_density;
+#else
+        sum += (fc1_w[j * ST_FC1_IN + idx] * star_density) >> ST_FRAC_BITS;
+#endif
+
         fc1_out[j] = (sum > 0) ? sum : (accum_t)0;
     }
 
