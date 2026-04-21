@@ -121,11 +121,11 @@ def geodesic_loss(q_pred, q_true):
 
 # CNN architecture — sized to fit Zynq-7020 BRAM (~90K params, ~1/3 of original).
 # Halved channels + k=3 conv1 + halved FC keeps 90-93 % accuracy at ~68 K params.
-CNN_CONV1_OUT_CH = 8
+CNN_CONV1_OUT_CH = 16
 CNN_CONV1_KERNEL = 3    # k=5→3 saves params; spatial size unchanged (p=1,s=2)
 CNN_CONV1_PAD = 1
-CNN_CONV2_OUT_CH = 16
-CNN_CONV3_OUT_CH = 32
+CNN_CONV2_OUT_CH = 32
+CNN_CONV3_OUT_CH = 64
 CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
@@ -794,7 +794,7 @@ def train_model(
     print(f"Using device: {device}")
 
     model = StarTrackerTinyCNN(num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
 
@@ -962,12 +962,12 @@ if __name__ == "__main__":
     catalog_seed  = UNIVERSE_SEED
     dataset_seed  = 42
     fov_x_degrees = 62.0
-    noise_prob    = 0.05
+    noise_prob    = 0.02
     reg_lambda    = 0.5
 
     model, star_catalog, val_loader = train_model(
-        num_samples=8000,
-        num_epochs=60,
+        num_samples=12000,
+        num_epochs=80,
         batch_size=128,
         learning_rate=3e-3,
         camera_width=camera_width,
