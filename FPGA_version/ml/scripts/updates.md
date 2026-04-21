@@ -5,4 +5,5 @@ The current model outputs two things simultaneously, vs a direction-only model t
 Current dual-head model outputs:
 
 cls_logits — 6 raw scores, one per sky sector (coarse direction, 90° apart)
+\\
 quat — [w, x, y, z] unit quaternion (precise 3D orientation, continuous)
