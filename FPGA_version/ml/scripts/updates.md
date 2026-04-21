@@ -1,4 +1,4 @@
-Input:
+Input: Is the same images.
 Output:
 The current model outputs two things simultaneously, vs a direction-only model that would output just one:
 
