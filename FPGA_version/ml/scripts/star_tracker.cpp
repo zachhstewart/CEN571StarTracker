@@ -30,12 +30,24 @@ void star_tracker_cnn(
     #pragma HLS INTERFACE s_axilite port=predicted_class bundle=CTRL
     #pragma HLS INTERFACE s_axilite port=return bundle=CTRL
 
+    // Hard cap on DSP usage — forces multipliers to be time-multiplexed rather
+    // than instantiated in parallel. Keeps DSP count well under the 220 limit.
+    #pragma HLS ALLOCATION operation instances=mul limit=4
+
     accum_t conv1_out[ST_CONV1_OUT_CH][ST_CONV1_OUT_H][ST_CONV1_OUT_W];
     accum_t conv2_out[ST_CONV2_OUT_CH][ST_CONV2_OUT_H][ST_CONV2_OUT_W];
     accum_t conv3_out[ST_CONV3_OUT_CH][ST_CONV3_OUT_H][ST_CONV3_OUT_W];
     accum_t pool_out[ST_CONV3_OUT_CH][ST_POOL_H][ST_POOL_W];
     accum_t fc1_out[ST_FC1_OUT];
     accum_t logits[ST_NUM_CLASSES];
+
+    // Force all large intermediate arrays to block RAM.
+    // Without these, HLS defaults to distributed LUT-RAM which exhausts LUTs
+    // (conv1_out alone would need ~38K LUTs on a 53K-LUT device).
+    #pragma HLS bind_storage variable=conv1_out type=RAM_2P impl=bram
+    #pragma HLS bind_storage variable=conv2_out type=RAM_2P impl=bram
+    #pragma HLS bind_storage variable=conv3_out type=RAM_2P impl=bram
+    #pragma HLS bind_storage variable=pool_out  type=RAM_2P impl=bram
 
     // ---- Stage 1: Conv1 + ReLU (BN folded into weights) ----
     for (int oc = 0; oc < ST_CONV1_OUT_CH; ++oc) {

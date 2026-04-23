@@ -119,19 +119,19 @@ def geodesic_loss(q_pred, q_true):
     return (1.0 - dot).mean()
 
 
-# CNN architecture — sized to fit Zynq-7020 BRAM (~90K params, ~1/3 of original).
-# Halved channels + k=3 conv1 + halved FC keeps 90-93 % accuracy at ~68 K params.
-CNN_CONV1_OUT_CH = 16
-CNN_CONV1_KERNEL = 3    # k=5→3 saves params; spatial size unchanged (p=1,s=2)
+# CNN architecture — sized to fit Zynq-7020 BRAM comfortably (~20 BRAMs total).
+# 80×60 input + 8/16/32 channels + pool(2,5) keeps feature maps small.
+CNN_CONV1_OUT_CH = 8
+CNN_CONV1_KERNEL = 3    # k=3, p=1, s=2: 80→40, 60→30
 CNN_CONV1_PAD = 1
-CNN_CONV2_OUT_CH = 32
-CNN_CONV3_OUT_CH = 64
+CNN_CONV2_OUT_CH = 16
+CNN_CONV3_OUT_CH = 32
 CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
-# After conv1(s=2): 80×60; conv2(s=2): 40×30; conv3(s=2): 20×15
-# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 32×3×5=480 features
-CNN_POOL_H = 3
+# 80×60 input: conv1→40×30, conv2→20×15, conv3→10×8
+# AdaptiveAvgPool2d((2,5)): 8/2=4, 10/5=2 → integer bins, 32×2×5=320 features
+CNN_POOL_H = 2
 CNN_POOL_W = 5
 CNN_FC1_OUT = 64
 
@@ -705,8 +705,8 @@ def train_model(
     learning_rate=3e-3,
     camera_width=640,
     camera_height=480,
-    model_width=160,
-    model_height=120,
+    model_width=80,
+    model_height=60,
     fov_x_degrees=62.0,
     noise_prob=0.02,
     psf_sigma=1.5,
@@ -956,8 +956,8 @@ if __name__ == "__main__":
 
     camera_width  = 640
     camera_height = 480
-    model_width   = 160
-    model_height  = 120
+    model_width   = 80
+    model_height  = 60
     frac_bits     = 8
     catalog_seed  = UNIVERSE_SEED
     dataset_seed  = 42

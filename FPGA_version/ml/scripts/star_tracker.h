@@ -4,7 +4,7 @@
 // Set to 1 for software float simulation, 0 for HLS fixed-point mode.
 // In FLOAT mode you can test quickly on a host compiler.
 // In FIXED-POINT mode you exercise the quantized path intended for synthesis.
-#define STAR_TRACKER_USE_FLOAT 1
+#define STAR_TRACKER_USE_FLOAT 0
 
 #include "../models/star_tracker_weights.h"
 
@@ -33,7 +33,7 @@ typedef float accum_t;
 #else
 // FIXED mode: use compact integer types expected by HLS.
 typedef ap_uint<PIXEL_WIDTH> pixel_t;
-typedef ap_int<32> accum_t;
+typedef ap_int<28> accum_t;  // 28-bit: safe for 16ch×9-element accumulation with 8-bit weights
 #endif
 
 // Top-level CNN hardware function for HLS.
