@@ -4,7 +4,7 @@
 // Set to 1 for software float simulation, 0 for HLS fixed-point mode.
 // In FLOAT mode you can test quickly on a host compiler.
 // In FIXED-POINT mode you exercise the quantized path intended for synthesis.
-#define STAR_TRACKER_USE_FLOAT 0
+#define STAR_TRACKER_USE_FLOAT 1
 
 #include "../models/star_tracker_weights.h"
 
@@ -19,7 +19,13 @@
 #define ST_CONV3_OUT_W ((ST_CONV2_OUT_W  + 2 * ST_CONV3_PAD - ST_CONV3_K) / ST_CONV3_STRIDE + 1)
 #define ST_CONV3_OUT_H ((ST_CONV2_OUT_H  + 2 * ST_CONV3_PAD - ST_CONV3_K) / ST_CONV3_STRIDE + 1)
 
-// Spatial-pool bin sizes (must be integer: 20/5=4, 15/3=5).
+// The maximum size needed for any intermediate feature map layer buffer
+// buffer_A holds conv1_out (32,400) and later conv3_out (8,640)
+#define ST_MAX_BUFFER_SIZE (ST_CONV1_OUT_CH * ST_CONV1_OUT_H * ST_CONV1_OUT_W)
+// buffer_B holds conv2_out (16,560)
+#define ST_BUFFER_B_SIZE   (ST_CONV2_OUT_CH * ST_CONV2_OUT_H * ST_CONV2_OUT_W)
+
+// Spatial-pool bin sizes (must be integer)
 #define ST_POOL_BIN_W (ST_CONV3_OUT_W / ST_POOL_W)
 #define ST_POOL_BIN_H (ST_CONV3_OUT_H / ST_POOL_H)
 

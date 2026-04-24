@@ -213,7 +213,7 @@ def render_view(manifest, star_catalog, output_path=None, psf_sigma=1.5):
 class StarTrackerTinyCNN(nn.Module):
     """Dual-head CNN — must exactly mirror the architecture in train.py."""
     NUM_CLASSES = 6
-    CONV1_OUT_CH = 16;  CONV2_OUT_CH = 32;  CONV3_OUT_CH = 64
+    CONV1_OUT_CH = 12;  CONV2_OUT_CH = 24;  CONV3_OUT_CH = 48
     CONV1_K = 3;        KERNEL = 3;         STRIDE = 2
     CONV1_PAD = 1;      PAD = 1
     POOL_H = 3;         POOL_W = 5;         FC1_OUT = 64
@@ -271,7 +271,7 @@ def load_model(manifest_path, device):
 
 def render_interactive(manifest, star_catalog, model, temperature, device,
                        camera_width=640, camera_height=480,
-                       model_width=160, model_height=120):
+                       model_width=120, model_height=90):
     """
     Interactive viewer with sliders for pitch/roll/yaw/fov and real-time CNN inference.
     

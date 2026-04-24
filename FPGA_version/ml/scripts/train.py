@@ -119,19 +119,19 @@ def geodesic_loss(q_pred, q_true):
     return (1.0 - dot).mean()
 
 
-# CNN architecture — sized to fit Zynq-7020 BRAM comfortably (~20 BRAMs total).
-# 80×60 input + 8/16/32 channels + pool(2,5) keeps feature maps small.
-CNN_CONV1_OUT_CH = 8
-CNN_CONV1_KERNEL = 3    # k=3, p=1, s=2: 80→40, 60→30
+# CNN architecture — sized to fit Zynq-7020 BRAM comfortably using flip-flop buffers.
+# 120x90 input + 12/24/48 channels + pool(3,5) to adapt to new size.
+CNN_CONV1_OUT_CH = 12
+CNN_CONV1_KERNEL = 3    # k=3, p=1, s=2: 120->60, 90->45
 CNN_CONV1_PAD = 1
-CNN_CONV2_OUT_CH = 16
-CNN_CONV3_OUT_CH = 32
+CNN_CONV2_OUT_CH = 24
+CNN_CONV3_OUT_CH = 48
 CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
-# 80×60 input: conv1→40×30, conv2→20×15, conv3→10×8
-# AdaptiveAvgPool2d((2,5)): 8/2=4, 10/5=2 → integer bins, 32×2×5=320 features
-CNN_POOL_H = 2
+# 120x90 input: conv1->60x45, conv2->30x23, conv3->15x12
+# AdaptiveAvgPool2d((3,5)): 12/3=4, 15/5=3 -> integer bins, 48x3x5 = 720 features
+CNN_POOL_H = 3
 CNN_POOL_W = 5
 CNN_FC1_OUT = 64
 
@@ -956,8 +956,8 @@ if __name__ == "__main__":
 
     camera_width  = 640
     camera_height = 480
-    model_width   = 80
-    model_height  = 60
+    model_width   = 120
+    model_height  = 90
     frac_bits     = 8
     catalog_seed  = UNIVERSE_SEED
     dataset_seed  = 42

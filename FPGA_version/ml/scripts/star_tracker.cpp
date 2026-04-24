@@ -22,6 +22,11 @@ static inline int conv3_w_idx(int oc, int ic, int ky, int kx) {
 }
 static inline int input_idx(int y, int x) { return y * ST_INPUT_WIDTH + x; }
 
+// Index for flattened feature maps using ping-pong buffers
+static inline int fm_idx(int c, int y, int x, int H, int W) {
+    return (c * H + y) * W + x;
+}
+
 void star_tracker_cnn(
     const pixel_t input_image[ST_INPUT_PIXELS],
     int *predicted_class
@@ -34,19 +39,16 @@ void star_tracker_cnn(
     // than instantiated in parallel. Keeps DSP count well under the 220 limit.
     #pragma HLS ALLOCATION operation instances=mul limit=4
 
-    accum_t conv1_out[ST_CONV1_OUT_CH][ST_CONV1_OUT_H][ST_CONV1_OUT_W];
-    accum_t conv2_out[ST_CONV2_OUT_CH][ST_CONV2_OUT_H][ST_CONV2_OUT_W];
-    accum_t conv3_out[ST_CONV3_OUT_CH][ST_CONV3_OUT_H][ST_CONV3_OUT_W];
+    accum_t buffer_A[ST_MAX_BUFFER_SIZE];
+    accum_t buffer_B[ST_BUFFER_B_SIZE];
     accum_t pool_out[ST_CONV3_OUT_CH][ST_POOL_H][ST_POOL_W];
     accum_t fc1_out[ST_FC1_OUT];
     accum_t logits[ST_NUM_CLASSES];
 
     // Force all large intermediate arrays to block RAM.
-    // Without these, HLS defaults to distributed LUT-RAM which exhausts LUTs
-    // (conv1_out alone would need ~38K LUTs on a 53K-LUT device).
-    #pragma HLS bind_storage variable=conv1_out type=RAM_2P impl=bram
-    #pragma HLS bind_storage variable=conv2_out type=RAM_2P impl=bram
-    #pragma HLS bind_storage variable=conv3_out type=RAM_2P impl=bram
+    // By using just two buffers in ping-pong, BRAM footprint is minimized.
+    #pragma HLS bind_storage variable=buffer_A type=RAM_2P impl=bram
+    #pragma HLS bind_storage variable=buffer_B type=RAM_2P impl=bram
     #pragma HLS bind_storage variable=pool_out  type=RAM_2P impl=bram
 
     // ---- Stage 1: Conv1 + ReLU (BN folded into weights) ----
@@ -73,7 +75,7 @@ void star_tracker_cnn(
                         }
                     }
                 }
-                conv1_out[oc][oy][ox] = (sum > 0) ? sum : (accum_t)0;
+                buffer_A[fm_idx(oc, oy, ox, ST_CONV1_OUT_H, ST_CONV1_OUT_W)] = (sum > 0) ? sum : (accum_t)0;
             }
         }
     }
@@ -95,15 +97,15 @@ void star_tracker_cnn(
                             if (in_y >= 0 && in_y < ST_CONV1_OUT_H && in_x >= 0 && in_x < ST_CONV1_OUT_W) {
 #if STAR_TRACKER_USE_FLOAT
                                 sum += dequantize_weight(conv2_w[conv2_w_idx(oc, ic, ky, kx)])
-                                       * conv1_out[ic][in_y][in_x];
+                                       * buffer_A[fm_idx(ic, in_y, in_x, ST_CONV1_OUT_H, ST_CONV1_OUT_W)];
 #else
-                                sum += (conv2_w[conv2_w_idx(oc, ic, ky, kx)] * conv1_out[ic][in_y][in_x]) >> ST_FRAC_BITS;
+                                sum += (conv2_w[conv2_w_idx(oc, ic, ky, kx)] * buffer_A[fm_idx(ic, in_y, in_x, ST_CONV1_OUT_H, ST_CONV1_OUT_W)]) >> ST_FRAC_BITS;
 #endif
                             }
                         }
                     }
                 }
-                conv2_out[oc][oy][ox] = (sum > 0) ? sum : (accum_t)0;
+                buffer_B[fm_idx(oc, oy, ox, ST_CONV2_OUT_H, ST_CONV2_OUT_W)] = (sum > 0) ? sum : (accum_t)0;
             }
         }
     }
@@ -125,15 +127,16 @@ void star_tracker_cnn(
                             if (in_y >= 0 && in_y < ST_CONV2_OUT_H && in_x >= 0 && in_x < ST_CONV2_OUT_W) {
 #if STAR_TRACKER_USE_FLOAT
                                 sum += dequantize_weight(conv3_w[conv3_w_idx(oc, ic, ky, kx)])
-                                       * conv2_out[ic][in_y][in_x];
+                                       * buffer_B[fm_idx(ic, in_y, in_x, ST_CONV2_OUT_H, ST_CONV2_OUT_W)];
 #else
-                                sum += (conv3_w[conv3_w_idx(oc, ic, ky, kx)] * conv2_out[ic][in_y][in_x]) >> ST_FRAC_BITS;
+                                sum += (conv3_w[conv3_w_idx(oc, ic, ky, kx)] * buffer_B[fm_idx(ic, in_y, in_x, ST_CONV2_OUT_H, ST_CONV2_OUT_W)]) >> ST_FRAC_BITS;
 #endif
                             }
                         }
                     }
                 }
-                conv3_out[oc][oy][ox] = (sum > 0) ? sum : (accum_t)0;
+                // Write Conv3 output back to buffer_A
+                buffer_A[fm_idx(oc, oy, ox, ST_CONV3_OUT_H, ST_CONV3_OUT_W)] = (sum > 0) ? sum : (accum_t)0;
             }
         }
     }
@@ -152,7 +155,7 @@ void star_tracker_cnn(
                     for (int dx = 0; dx < ST_POOL_BIN_W; ++dx) {
                         int fy = ph * ST_POOL_BIN_H + dy;
                         int fx = pw * ST_POOL_BIN_W + dx;
-                        sum += conv3_out[c][fy][fx];
+                        sum += buffer_A[fm_idx(c, fy, fx, ST_CONV3_OUT_H, ST_CONV3_OUT_W)];
                     }
                 }
                 pool_out[c][ph][pw] = sum / (ST_POOL_BIN_H * ST_POOL_BIN_W);
