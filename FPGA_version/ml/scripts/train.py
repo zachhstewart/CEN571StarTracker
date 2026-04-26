@@ -507,17 +507,25 @@ def evaluate(model, loader, criterion, device, reg_lambda=0.5):
     angle_errors = []
     total_inf_time = 0.0
 
+    # Force inference on CPU to serve as a proper software baseline
+    model.to("cpu")
+
     with torch.no_grad():
         for images, labels, quats in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            quats  = quats.to(device)
+            # Move inputs to CPU for inference timing
+            images_cpu = images.to("cpu")
 
             start_t = time.perf_counter()
-            cls_logits, q_pred = model(images)
+            cls_logits_cpu, q_pred_cpu = model(images_cpu)
             end_t = time.perf_counter()
             
             total_inf_time += (end_t - start_t)
+
+            # Move results back to original device for loss/metric calculation
+            cls_logits = cls_logits_cpu.to(device)
+            q_pred = q_pred_cpu.to(device)
+            labels = labels.to(device)
+            quats  = quats.to(device)
 
             cls_loss = criterion(cls_logits, labels)
             reg_loss = geodesic_loss(q_pred, quats)
@@ -531,9 +539,13 @@ def evaluate(model, loader, criterion, device, reg_lambda=0.5):
             errs = angular_error_deg_batch(q_pred, quats)
             angle_errors.append(errs.cpu())
 
+    # Restore model to original training device
+    model.to(device)
+
     mean_angle_err = torch.cat(angle_errors).mean().item()
     avg_inf_time_ms = (total_inf_time / total) * 1000.0
-    return running_loss / total, 100.0 * correct / total, mean_angle_err, avg_inf_time_ms
+    throughput_fps = total / total_inf_time
+    return running_loss / total, 100.0 * correct / total, mean_angle_err, avg_inf_time_ms, throughput_fps
 
 
 def calibrate_temperature(model, val_loader, device):
@@ -808,7 +820,7 @@ def train_model(
 
     history = {
         "train_loss": [], "train_acc": [], "train_ang": [],
-        "val_loss": [], "val_acc": [], "val_ang": [], "val_inf_time": []
+        "val_loss": [], "val_acc": [], "val_ang": [], "val_inf_time": [], "val_fps": []
     }
 
     current_phase = 0
@@ -854,7 +866,7 @@ def train_model(
         train_loss = running_loss / total
         train_acc  = 100.0 * correct / total
         train_ang  = torch.cat(angle_errors).mean().item()
-        val_loss, val_acc, val_ang, val_inf_time = evaluate(model, val_loader, criterion, device, reg_lambda)
+        val_loss, val_acc, val_ang, val_inf_time, val_fps = evaluate(model, val_loader, criterion, device, reg_lambda)
 
         history["train_loss"].append(train_loss)
         history["train_acc"].append(train_acc)
@@ -863,13 +875,14 @@ def train_model(
         history["val_acc"].append(val_acc)
         history["val_ang"].append(val_ang)
         history["val_inf_time"].append(val_inf_time)
+        history["val_fps"].append(val_fps)
 
         print(
             f"Epoch [{epoch + 1:3d}/{num_epochs}] "
             f"Ph{current_phase + 1} "
             f"Loss:{train_loss:.4f} Acc:{train_acc:.1f}% AngErr:{train_ang:.1f}° | "
             f"Val Loss:{val_loss:.4f} Acc:{val_acc:.1f}% AngErr:{val_ang:.1f}° | "
-            f"Val InfTime/sample: {val_inf_time:.4f}ms"
+            f"Val Throughput: {val_fps:.1f} FPS"
         )
 
     print("Training complete.")
@@ -1012,15 +1025,15 @@ def plot_metrics(history, save_path):
     axs[1, 0].grid(True, linestyle='--', alpha=0.7)
 
     # 4. Inference Time Plot
-    axs[1, 1].plot(epochs, history["val_inf_time"], label='Software Inference', color='tab:pink', linewidth=2)
+    axs[1, 1].plot(epochs, history["val_fps"], label='Software Throughput', color='tab:pink', linewidth=2)
     
     # Calculate average time to show on the plot
-    avg_time = np.mean(history["val_inf_time"])
-    axs[1, 1].axhline(y=avg_time, color='black', linestyle=':', label=f'Avg: {avg_time:.2f} ms')
+    avg_fps = np.mean(history["val_fps"])
+    axs[1, 1].axhline(y=avg_fps, color='black', linestyle=':', label=f'Avg: {avg_fps:.1f} FPS')
     
-    axs[1, 1].set_title('Validation Inference Time vs Epoch', fontsize=14)
+    axs[1, 1].set_title('Validation Throughput vs Epoch', fontsize=14)
     axs[1, 1].set_xlabel('Epoch', fontsize=12)
-    axs[1, 1].set_ylabel('Time (ms / sample)', fontsize=12)
+    axs[1, 1].set_ylabel('Throughput (Frames/Second)', fontsize=12)
     axs[1, 1].legend(fontsize=11)
     axs[1, 1].grid(True, linestyle='--', alpha=0.7)
 
