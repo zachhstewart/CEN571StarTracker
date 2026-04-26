@@ -787,7 +787,9 @@ def train_model(
         )
         tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                         num_workers=num_workers, persistent_workers=num_workers > 0)
-        va = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+        
+        # Use batch_size=1 for validation to measure true unbatched sequential stream throughput
+        va = DataLoader(val_ds,   batch_size=1, shuffle=False,
                         num_workers=num_workers, persistent_workers=num_workers > 0)
         return tr, va
 
