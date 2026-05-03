@@ -28,7 +28,7 @@ static inline int fm_idx(int c, int y, int x, int H, int W) {
 }
 
 void star_tracker_cnn(
-    const pixel_t input_image[ST_INPUT_PIXELS],
+    const pixel_word_t input_image[ST_INPUT_WORDS],
     int *predicted_class
 ) {
     #pragma HLS INTERFACE bram port=input_image
@@ -67,10 +67,10 @@ void star_tracker_cnn(
                         if (in_y >= 0 && in_y < ST_INPUT_HEIGHT && in_x >= 0 && in_x < ST_INPUT_WIDTH) {
 #if STAR_TRACKER_USE_FLOAT
                             sum += dequantize_weight(conv1_w[conv1_w_idx(oc, 0, ky, kx)])
-                                   * get_input_value(input_image[input_idx(in_y, in_x)]);
+                                   * get_input_value(unpack_pixel(input_image, input_idx(in_y, in_x)));
 #else
                             accum_t w = conv1_w[conv1_w_idx(oc, 0, ky, kx)];
-                            sum += (w * to_fixed_input(input_image[input_idx(in_y, in_x)])) >> ST_FRAC_BITS;
+                            sum += (w * to_fixed_input(unpack_pixel(input_image, input_idx(in_y, in_x)))) >> ST_FRAC_BITS;
 #endif
                         }
                     }
@@ -171,9 +171,9 @@ void star_tracker_cnn(
 #endif
     for (int i = 0; i < ST_INPUT_PIXELS; ++i) {
 #if STAR_TRACKER_USE_FLOAT
-        star_density += get_input_value(input_image[i]);
+        star_density += get_input_value(unpack_pixel(input_image, i));
 #else
-        star_density += to_fixed_input(input_image[i]);
+        star_density += to_fixed_input(unpack_pixel(input_image, i));
 #endif
     }
     star_density /= ST_INPUT_PIXELS;

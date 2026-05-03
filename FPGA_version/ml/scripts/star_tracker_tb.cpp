@@ -5,17 +5,23 @@
 // This does not verify model accuracy on real data; it checks that the end-to-end
 // inference pipeline executes and returns a valid class index.
 
-static void clear_image(pixel_t input_image[ST_INPUT_PIXELS]) {
-    for (int i = 0; i < ST_INPUT_PIXELS; ++i) {
+static void clear_image(pixel_word_t input_image[ST_INPUT_WORDS]) {
+    for (int i = 0; i < ST_INPUT_WORDS; ++i)
         input_image[i] = 0;
-    }
 }
 
-static void set_pixel(pixel_t input_image[ST_INPUT_PIXELS], int y, int x, pixel_t value) {
+static void set_pixel(pixel_word_t input_image[ST_INPUT_WORDS], int y, int x, pixel_t value) {
+#if STAR_TRACKER_USE_FLOAT
     input_image[y * ST_INPUT_WIDTH + x] = value;
+#else
+    int flat = y * ST_INPUT_WIDTH + x;
+    int byte_pos = (flat & 3) * 8;
+    pixel_word_t mask = ~(pixel_word_t(0xFF) << byte_pos);
+    input_image[flat >> 2] = (input_image[flat >> 2] & mask) | (pixel_word_t(value) << byte_pos);
+#endif
 }
 
-static void build_cross_pattern(pixel_t input_image[ST_INPUT_PIXELS]) {
+static void build_cross_pattern(pixel_word_t input_image[ST_INPUT_WORDS]) {
     // Synthetic plus-sign shape near image center.
     clear_image(input_image);
     const int cx = ST_INPUT_WIDTH / 2;
@@ -42,7 +48,7 @@ static void build_cross_pattern(pixel_t input_image[ST_INPUT_PIXELS]) {
     }
 }
 
-static void build_diagonal_pattern(pixel_t input_image[ST_INPUT_PIXELS]) {
+static void build_diagonal_pattern(pixel_word_t input_image[ST_INPUT_WORDS]) {
     // Sparse diagonal points to produce a very different activation pattern.
     clear_image(input_image);
     int length = (ST_INPUT_WIDTH < ST_INPUT_HEIGHT) ? ST_INPUT_WIDTH : ST_INPUT_HEIGHT;
@@ -55,7 +61,7 @@ static void build_diagonal_pattern(pixel_t input_image[ST_INPUT_PIXELS]) {
     }
 }
 
-static bool run_case(const char* name, const pixel_t input_image[ST_INPUT_PIXELS]) {
+static bool run_case(const char* name, const pixel_word_t input_image[ST_INPUT_WORDS]) {
     int predicted_class = -1;
     star_tracker_cnn(input_image, &predicted_class);
 
@@ -79,7 +85,7 @@ int main() {
 #endif
 
     bool all_passed = true;
-    pixel_t input_image[ST_INPUT_PIXELS];
+    pixel_word_t input_image[ST_INPUT_WORDS];
 
     // A few synthetic patterns are enough for smoke testing the kernel interface.
     build_cross_pattern(input_image);
