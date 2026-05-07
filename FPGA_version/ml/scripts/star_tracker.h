@@ -4,7 +4,7 @@
 // Set to 1 for software float simulation, 0 for HLS fixed-point mode.
 // In FLOAT mode you can test quickly on a host compiler.
 // In FIXED-POINT mode you exercise the quantized path intended for synthesis.
-#define STAR_TRACKER_USE_FLOAT 1
+#define STAR_TRACKER_USE_FLOAT 0
 
 #include "../models/star_tracker_weights.h"
 
@@ -19,7 +19,13 @@
 #define ST_CONV3_OUT_W ((ST_CONV2_OUT_W  + 2 * ST_CONV3_PAD - ST_CONV3_K) / ST_CONV3_STRIDE + 1)
 #define ST_CONV3_OUT_H ((ST_CONV2_OUT_H  + 2 * ST_CONV3_PAD - ST_CONV3_K) / ST_CONV3_STRIDE + 1)
 
-// Spatial-pool bin sizes (must be integer: 20/5=4, 15/3=5).
+// The maximum size needed for any intermediate feature map layer buffer
+// buffer_A holds conv1_out (32,400) and later conv3_out (8,640)
+#define ST_MAX_BUFFER_SIZE (ST_CONV1_OUT_CH * ST_CONV1_OUT_H * ST_CONV1_OUT_W)
+// buffer_B holds conv2_out (16,560)
+#define ST_BUFFER_B_SIZE   (ST_CONV2_OUT_CH * ST_CONV2_OUT_H * ST_CONV2_OUT_W)
+
+// Spatial-pool bin sizes (must be integer)
 #define ST_POOL_BIN_W (ST_CONV3_OUT_W / ST_POOL_W)
 #define ST_POOL_BIN_H (ST_CONV3_OUT_H / ST_POOL_H)
 
@@ -30,21 +36,31 @@
 // FLOAT mode: simple numeric types for software debugging.
 typedef float pixel_t;
 typedef float accum_t;
+// In float mode each word holds one pixel directly.
+typedef float pixel_word_t;
+#define ST_INPUT_WORDS ST_INPUT_PIXELS
+static inline pixel_t unpack_pixel(const pixel_word_t* img, int idx) { return img[idx]; }
 #else
 // FIXED mode: use compact integer types expected by HLS.
 typedef ap_uint<PIXEL_WIDTH> pixel_t;
-typedef ap_int<32> accum_t;
+typedef ap_int<28> accum_t;  // 28-bit: safe for 16ch×9-element accumulation with 8-bit weights
+// Four 8-bit pixels packed into one 32-bit word — matches the AXI BRAM Controller data width.
+typedef ap_uint<32> pixel_word_t;
+#define ST_INPUT_WORDS (ST_INPUT_PIXELS / 4)
+static inline pixel_t unpack_pixel(const pixel_word_t* img, int idx) {
+    return (pixel_t)((img[idx >> 2] >> ((idx & 3) * 8)) & 0xFF);
+}
 #endif
 
 // Top-level CNN hardware function for HLS.
 void star_tracker_cnn(
-	const pixel_t input_image[ST_INPUT_PIXELS],
+	const pixel_word_t input_image[ST_INPUT_WORDS],
 	int *predicted_class
 );
 
 // Backward-compatible alias for older test harnesses.
 inline void star_tracker_mlp(
-	const pixel_t input_image[ST_INPUT_PIXELS],
+	const pixel_word_t input_image[ST_INPUT_WORDS],
 	int *predicted_class
 ) {
 	star_tracker_cnn(input_image, predicted_class);

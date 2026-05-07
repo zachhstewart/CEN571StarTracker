@@ -19,6 +19,8 @@ from pathlib import Path
 import json
 import os
 import random
+import time
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
@@ -119,20 +121,21 @@ def geodesic_loss(q_pred, q_true):
     return (1.0 - dot).mean()
 
 
-# CNN architecture — balanced for both accuracy and FPGA feasibility.
-CNN_CONV1_OUT_CH = 16
-CNN_CONV1_KERNEL = 5    # larger receptive field for conv1
-CNN_CONV1_PAD = 2       # keeps 160→80 with stride 2
-CNN_CONV2_OUT_CH = 32
-CNN_CONV3_OUT_CH = 64
+# CNN architecture — sized to fit Zynq-7020 BRAM comfortably using flip-flop buffers.
+# 120x90 input + 12/24/48 channels + pool(3,5) to adapt to new size.
+CNN_CONV1_OUT_CH = 12
+CNN_CONV1_KERNEL = 3    # k=3, p=1, s=2: 120->60, 90->45
+CNN_CONV1_PAD = 1
+CNN_CONV2_OUT_CH = 24
+CNN_CONV3_OUT_CH = 48
 CNN_KERNEL = 3          # conv2 / conv3
 CNN_STRIDE = 2
 CNN_PAD = 1
-# After conv1(s=2): 80×60; conv2(s=2): 40×30; conv3(s=2): 20×15
-# AdaptiveAvgPool2d((3,5)): 15/3=5, 20/5=4 → integer bins, 64×3×5=960 features
+# 120x90 input: conv1->60x45, conv2->30x23, conv3->15x12
+# AdaptiveAvgPool2d((3,5)): 12/3=4, 15/5=3 -> integer bins, 48x3x5 = 720 features
 CNN_POOL_H = 3
 CNN_POOL_W = 5
-CNN_FC1_OUT = 128
+CNN_FC1_OUT = 64
 
 
 def make_star_catalog(num_stars=NUM_STARS, seed=UNIVERSE_SEED):
@@ -502,14 +505,27 @@ def evaluate(model, loader, criterion, device, reg_lambda=0.5):
     correct = 0
     total = 0
     angle_errors = []
+    total_inf_time = 0.0
+
+    # Force inference on CPU to serve as a proper software baseline
+    model.to("cpu")
 
     with torch.no_grad():
         for images, labels, quats in loader:
-            images = images.to(device)
+            # Move inputs to CPU for inference timing
+            images_cpu = images.to("cpu")
+
+            start_t = time.perf_counter()
+            cls_logits_cpu, q_pred_cpu = model(images_cpu)
+            end_t = time.perf_counter()
+            
+            total_inf_time += (end_t - start_t)
+
+            # Move results back to original device for loss/metric calculation
+            cls_logits = cls_logits_cpu.to(device)
+            q_pred = q_pred_cpu.to(device)
             labels = labels.to(device)
             quats  = quats.to(device)
-
-            cls_logits, q_pred = model(images)
 
             cls_loss = criterion(cls_logits, labels)
             reg_loss = geodesic_loss(q_pred, quats)
@@ -523,8 +539,13 @@ def evaluate(model, loader, criterion, device, reg_lambda=0.5):
             errs = angular_error_deg_batch(q_pred, quats)
             angle_errors.append(errs.cpu())
 
+    # Restore model to original training device
+    model.to(device)
+
     mean_angle_err = torch.cat(angle_errors).mean().item()
-    return running_loss / total, 100.0 * correct / total, mean_angle_err
+    avg_inf_time_ms = (total_inf_time / total) * 1000.0
+    throughput_fps = total / total_inf_time
+    return running_loss / total, 100.0 * correct / total, mean_angle_err, avg_inf_time_ms, throughput_fps
 
 
 def calibrate_temperature(model, val_loader, device):
@@ -698,14 +719,14 @@ def export_to_hls_header(model, output_header_path, frac_bits, model_width, mode
 
 
 def train_model(
-    num_samples=12000,
+    num_samples=9000,
     num_epochs=100,
     batch_size=128,
     learning_rate=3e-3,
     camera_width=640,
     camera_height=480,
-    model_width=160,
-    model_height=120,
+    model_width=80,
+    model_height=60,
     fov_x_degrees=62.0,
     noise_prob=0.02,
     psf_sigma=1.5,
@@ -718,16 +739,10 @@ def train_model(
 ):
     """
     Train the dual-head CNN with curriculum learning.
-
-    Curriculum phases (split equally across num_epochs):
-      Phase 1 — jitter=3°:  model sees tightly clustered classes, learns coarse features.
-      Phase 2 — jitter=8°:  moderate overlap, refines decision boundaries.
-      Phase 3 — jitter=15°: heavy overlap, forces robust quaternion regression.
-
     Combined loss: CrossEntropy(class) + reg_lambda * GeodesicLoss(quaternion)
     Returns: (model, star_catalog, val_loader) — val_loader used for temperature calibration.
     """
-    CURRICULUM_JITTERS = [3.0, 8.0, 15.0]
+    CURRICULUM_JITTERS = [10.0, 17.0, 25.0]
     phase_len = num_epochs // 3
 
     star_catalog = make_star_catalog(num_stars=NUM_STARS, seed=catalog_seed)
@@ -799,9 +814,14 @@ def train_model(
     print(f"Using device: {device}")
 
     model = StarTrackerTinyCNN(num_classes=NUM_CLASSES).to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-5)
+
+    history = {
+        "train_loss": [], "train_acc": [], "train_ang": [],
+        "val_loss": [], "val_acc": [], "val_ang": [], "val_inf_time": [], "val_fps": []
+    }
 
     current_phase = 0
     train_loader, val_loader = make_loaders(datasets[0])
@@ -846,17 +866,27 @@ def train_model(
         train_loss = running_loss / total
         train_acc  = 100.0 * correct / total
         train_ang  = torch.cat(angle_errors).mean().item()
-        val_loss, val_acc, val_ang = evaluate(model, val_loader, criterion, device, reg_lambda)
+        val_loss, val_acc, val_ang, val_inf_time, val_fps = evaluate(model, val_loader, criterion, device, reg_lambda)
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["train_ang"].append(train_ang)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
+        history["val_ang"].append(val_ang)
+        history["val_inf_time"].append(val_inf_time)
+        history["val_fps"].append(val_fps)
 
         print(
             f"Epoch [{epoch + 1:3d}/{num_epochs}] "
             f"Ph{current_phase + 1} "
             f"Loss:{train_loss:.4f} Acc:{train_acc:.1f}% AngErr:{train_ang:.1f}° | "
-            f"Val Loss:{val_loss:.4f} Acc:{val_acc:.1f}% AngErr:{val_ang:.1f}°"
+            f"Val Loss:{val_loss:.4f} Acc:{val_acc:.1f}% AngErr:{val_ang:.1f}° | "
+            f"Val Throughput: {val_fps:.1f} FPS"
         )
 
     print("Training complete.")
-    return model, star_catalog, val_loader
+    return model, star_catalog, val_loader, history
 
 
 def save_run_artifacts(
@@ -954,6 +984,67 @@ def save_run_artifacts(
     print(f"Saved manifest:        {versioned_manifest}")
 
 
+def plot_metrics(history, save_path):
+    """Generate high-quality charts for presentations comparing performance metrics."""
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    # Use a clean style if available, fallback gracefully
+    try:
+        plt.style.use('seaborn-v0_8-whitegrid')
+    except:
+        pass
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Star Tracker CNN Training & Inference Metrics', fontsize=18, fontweight='bold', y=0.96)
+
+    # 1. Loss Plot
+    axs[0, 0].plot(epochs, history["train_loss"], label='Train Loss', color='tab:blue', linewidth=2)
+    axs[0, 0].plot(epochs, history["val_loss"], label='Val Loss', color='tab:orange', linewidth=2)
+    axs[0, 0].set_title('Loss Over Epochs', fontsize=14)
+    axs[0, 0].set_xlabel('Epoch', fontsize=12)
+    axs[0, 0].set_ylabel('Combined Loss', fontsize=12)
+    axs[0, 0].legend(fontsize=11)
+    axs[0, 0].grid(True, linestyle='--', alpha=0.7)
+
+    # 2. Accuracy Plot
+    axs[0, 1].plot(epochs, history["train_acc"], label='Train Acc', color='tab:green', linewidth=2)
+    axs[0, 1].plot(epochs, history["val_acc"], label='Val Acc', color='tab:red', linewidth=2)
+    axs[0, 1].set_title('Classification Base Accuracy', fontsize=14)
+    axs[0, 1].set_xlabel('Epoch', fontsize=12)
+    axs[0, 1].set_ylabel('Accuracy (%)', fontsize=12)
+    axs[0, 1].legend(fontsize=11)
+    axs[0, 1].grid(True, linestyle='--', alpha=0.7)
+
+    # 3. Angular Error Plot
+    axs[1, 0].plot(epochs, history["train_ang"], label='Train Err', color='tab:purple', linewidth=2)
+    axs[1, 0].plot(epochs, history["val_ang"], label='Val Err', color='tab:brown', linewidth=2)
+    axs[1, 0].set_title('Quaternion Angular Error', fontsize=14)
+    axs[1, 0].set_xlabel('Epoch', fontsize=12)
+    axs[1, 0].set_ylabel('Mean Error (Degrees)', fontsize=12)
+    axs[1, 0].legend(fontsize=11)
+    axs[1, 0].grid(True, linestyle='--', alpha=0.7)
+
+    # 4. Inference Time Plot
+    axs[1, 1].plot(epochs, history["val_fps"], label='Software Throughput', color='tab:pink', linewidth=2)
+    
+    # Calculate average time to show on the plot
+    avg_fps = np.mean(history["val_fps"])
+    axs[1, 1].axhline(y=avg_fps, color='black', linestyle=':', label=f'Avg: {avg_fps:.1f} FPS')
+    
+    axs[1, 1].set_title('Validation Throughput vs Epoch', fontsize=14)
+    axs[1, 1].set_xlabel('Epoch', fontsize=12)
+    axs[1, 1].set_ylabel('Throughput (Frames/Second)', fontsize=12)
+    axs[1, 1].legend(fontsize=11)
+    axs[1, 1].grid(True, linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    # Add a bit of space at the top for the title
+    fig.subplots_adjust(top=0.90)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved high-res presentation plot: {save_path}")
+
+
 if __name__ == "__main__":
     random.seed(7)
     np.random.seed(7)
@@ -961,18 +1052,18 @@ if __name__ == "__main__":
 
     camera_width  = 640
     camera_height = 480
-    model_width   = 160
-    model_height  = 120
+    model_width   = 120
+    model_height  = 90
     frac_bits     = 8
     catalog_seed  = UNIVERSE_SEED
     dataset_seed  = 42
     fov_x_degrees = 62.0
-    noise_prob    = 0.01
+    noise_prob    = 0.02
     reg_lambda    = 0.5
 
-    model, star_catalog, val_loader = train_model(
+    model, star_catalog, val_loader, history = train_model(
         num_samples=12000,
-        num_epochs=100,
+        num_epochs=80,
         batch_size=128,
         learning_rate=3e-3,
         camera_width=camera_width,
@@ -1010,8 +1101,11 @@ if __name__ == "__main__":
         catalog_seed=catalog_seed,
         dataset_seed=dataset_seed,
         fov_x_degrees=fov_x_degrees,
-        jitter_degrees=15.0,
+        jitter_degrees=25.0,
         noise_prob=noise_prob,
         temperature=temperature,
         reg_lambda=reg_lambda,
     )
+
+    metrics_path = models_dir / f"training_metrics_{run_id}.png"
+    plot_metrics(history, metrics_path)
