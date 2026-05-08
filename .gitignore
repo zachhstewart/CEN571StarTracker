@@ -28,12 +28,12 @@ Baseline_CPU_version/training_curves.png
 Baseline_CPU_version/confusion_matrix.png
 
 # FPGA / ML generated artifacts
-FPGA_version/ml/models/*.json
-FPGA_version/ml/models/*.npy
-FPGA_version/ml/models/*.pth
-FPGA_version/ml/models/*_seed*.h
-FPGA_version/ml/models/star_tracker_weights.h
-FPGA_version/ml/scripts/star_tracker_tb_float
+src/ml/models/*.json
+src/ml/models/*.npy
+src/ml/models/*.pth
+src/ml/models/*_seed*.h
+src/ml/models/star_tracker_weights.h
+src/ml/scripts/star_tracker_tb_float
 
 # HLS / build outputs
 csim_results/
